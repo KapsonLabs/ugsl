@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+ug_env/
+.DS_Store
+datasets/.capture-*/
+datasets/raw/*
+!datasets/raw/.gitkeep
