@@ -8,6 +8,7 @@ import typer
 
 from annotation import commands as linguistic_commands
 from config import DATASET_ROOT, REGISTRY_PATH, CaptureConfig, validate_identifier
+from dataset_export import commands as dataset_commands
 from ingestion import commands as media_commands
 from ingestion.capture import CameraCapture
 from ingestion.exceptions import CaptureError, MediaError
@@ -20,6 +21,7 @@ DEFAULTS = CaptureConfig()
 commands.mount(app)
 media_commands.mount(app)
 linguistic_commands.mount(app)
+dataset_commands.mount(app)
 
 
 @app.callback()

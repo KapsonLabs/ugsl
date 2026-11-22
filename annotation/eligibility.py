@@ -30,7 +30,7 @@ class TrainingEligibilityService:
         with self.db.connect() as connection:
             return self.evaluate(connection, repository.sample(connection, sample_id))
 
-    def evaluate(self, connection, sample) -> TrainingEligibility:
+    def evaluate(self, connection, sample, *, verify_media: bool = True) -> TrainingEligibility:
         try:
             if sample.status != "APPROVED" or sample.review_state != ReviewState.APPROVED:
                 raise RegistryError("The sample has no current linguistic approval.")
@@ -44,7 +44,7 @@ class TrainingEligibilityService:
                 raise RegistryError("The dual-review policy requires independent approval.")
             if repository.conflicting(votes) and not final.is_adjudication:
                 raise RegistryError("Conflicting decisions require a final adjudication.")
-            self.validator.media(connection, sample, verify=True)
+            self.validator.media(connection, sample, verify=verify_media)
             sign = vocabulary.find(connection, annotation.sign_id)
             if not sign.is_active:
                 raise RegistryError("The verified sign or variant is inactive.")

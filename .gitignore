@@ -11,3 +11,5 @@ datasets/staging/*
 !datasets/staging/.gitkeep
 datasets/quarantine/*
 !datasets/quarantine/.gitkeep
+datasets/exports/*
+!datasets/exports/.gitkeep

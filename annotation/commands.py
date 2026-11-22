@@ -13,7 +13,7 @@ from annotation.service import AnnotationService
 from config import ReviewConfig
 from ingestion.exceptions import MediaError
 from registry import reviewers
-from registry.commands import _details, _table, database, report_errors, sample_app
+from registry.commands import _details, _report_revoked_datasets, _table, database, report_errors, sample_app
 from registry.database import RegistryError
 
 reviewer_app = typer.Typer(help="Manage local linguistic reviewers.", no_args_is_help=True)
@@ -170,6 +170,7 @@ def annotation_correct(
         changes["confidence"] = None
     _details(_service(ctx).correct(sample_id, reviewer, reason=reason, expected_annotation_id=annotation_id,
                                    expected_round=review_round, **changes))
+    _report_revoked_datasets(database(ctx), sample_id=sample_id.strip().lower())
 
 
 @annotation_app.command("request-variant")
@@ -255,6 +256,7 @@ def review_reopen(
     _details(_service(ctx).reopen(sample_id, reviewer, reason=reason, expected_annotation_id=annotation_id,
                                   expected_round=review_round))
     typer.echo("Review state ANNOTATED")
+    _report_revoked_datasets(database(ctx), sample_id=sample_id.strip().lower())
 
 
 @review_app.command("history")

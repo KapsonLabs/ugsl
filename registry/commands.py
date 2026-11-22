@@ -171,11 +171,31 @@ def signer_deactivate(ctx: typer.Context, code: str):
 
 
 def _show_consent(ctx, code, status, reference):
-    signer, affected = signers.consent(database(ctx), code, status, reference)
+    db = database(ctx)
+    signer, affected = signers.consent(db, code, status, reference)
     typer.echo(f"{signer.code}: {signer.consent_status} ({signer.consent_recorded_at})")
     if signer.consent_status == "WITHDRAWN":
         typer.echo(f"{len(affected)} registered samples excluded. Review these file pairs for retention.")
         _table([asdict(row) for row in affected], ("id", "file_path", "metadata_path"))
+    if signer.consent_status != "GRANTED":
+        _report_revoked_datasets(db, signer=signer.id)
+
+
+def _report_revoked_datasets(db, **filters):
+    from dataset_export.service import write_revocation_notice
+    from registry import datasets
+
+    versions = [version for version in datasets.affected(db, **filters) if version.status == "REVOKED"]
+    if not versions:
+        return
+    typer.echo("Revoked dataset versions")
+    _table([asdict(version) for version in versions], ("name", "version", "export_mode", "output_path"))
+    for version in versions:
+        try:
+            write_revocation_notice(version)
+        except (RegistryError, OSError) as exc:
+            typer.echo(f"Local revocation notice pending. Run dataset reconcile. {exc}", err=True)
+    typer.echo("Stop using revoked versions and coordinate removal of portable copies and dependent artifacts.")
 
 
 @signer_app.command("consent")

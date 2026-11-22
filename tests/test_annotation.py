@@ -81,7 +81,7 @@ def test_migration_preserves_prior_samples_without_verifying_them(tmp_path, monk
                 )
     for _ in range(2):
         with db.connect() as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
             assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         sample = samples.show(db, sid)

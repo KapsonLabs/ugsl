@@ -65,7 +65,7 @@ def test_lazy_database_initialization_and_foreign_keys(db):
     assert not db.path.exists()
     with db.connect(write=True) as connection:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
             connection.execute(
                 """INSERT INTO recording_sessions
@@ -84,18 +84,18 @@ def test_migrations_are_atomic_idempotent_and_preserve_existing_rows(db, tmp_pat
     migrations = tmp_path / "migrations"
     shutil.copytree(database.MIGRATIONS, migrations)
     monkeypatch.setattr(database, "MIGRATIONS", migrations)
-    script = migrations / "004_test.sql"
+    script = migrations / "005_test.sql"
     script.write_text("CREATE TABLE migration_test (name TEXT); INVALID SQL;")
     with pytest.raises(RegistryError, match="migration failed"):
         vocabulary.show(db, sign.id)
     with sqlite3.connect(db.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("SELECT name FROM sqlite_master WHERE name = 'migration_test'").fetchone() is None
     script.write_text("CREATE TABLE migration_test (name TEXT);")
     for _ in range(2):
         assert vocabulary.show(Database(db.path), sign.id) == sign
         with db.connect() as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 
 
 def test_write_transaction_rolls_back_and_database_error_is_sanitized(db, tmp_path):

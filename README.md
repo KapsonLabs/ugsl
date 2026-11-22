@@ -1,6 +1,6 @@
-# UGSL Recognition Engine · Phase 1.4
+# UGSL Recognition Engine · Phase 1.5
 
-Collect labelled Ugandan Sign Language video samples and manage the dataset in a local SQLite registry. Operators record takes in OpenCV or import existing local video files. Both paths run through the same technical checks before storing the original video bytes and registering the sample. The registry links each sample to a vocabulary entry and a recording session for an eligible signer. Human annotators mark the sign interval, and linguistic reviewers verify the annotation before the sample becomes training-eligible.
+Collect labelled Ugandan Sign Language video samples and manage the dataset in a local SQLite registry. Operators record takes in OpenCV or import existing local video files. Both paths run through the same technical checks before storing the original video bytes and registering the sample. The registry links each sample to a vocabulary entry and a recording session for an eligible signer. Human annotators mark the sign interval, and linguistic reviewers verify the annotation before the sample becomes training-eligible. Versioned exports freeze the approved clips, annotation intervals, and class mapping for isolated-sign training.
 
 ## Install
 
@@ -174,6 +174,7 @@ datasets/
 ├── registry.db
 ├── staging/
 ├── quarantine/
+├── exports/
 ├── raw/
 │   └── UGSL0001/SIGNER001/
 │       ├── <uuid>.mp4
@@ -195,9 +196,12 @@ datasets/
 | `annotations` | Immutable sign and interval versions linked to the sample, annotator, and prior version |
 | `review_decisions` | Append-only reviewer decisions scoped to an annotation version and review round, with reasons and adjudication flags |
 | `review_events` | Review start, reopen, and variant-request history |
+| `dataset_versions` | Named semantic versions, artifact schema, lifecycle, manifest checksum, content fingerprint, and the effective local export configuration |
+| `dataset_members` | Snapshot of each included sample, exact annotation and approval round, verified sign, signer, and entry and source checksums |
+| `dataset_events` | Dataset lifecycle transitions, timestamps, and revocation or failure reasons |
 | `sign_sequence` | Counter used to allocate permanent vocabulary IDs |
 
-SQLite enforces foreign keys on every connection. Migration 002 copies existing sample rows into the extended schema inside a transaction and preserves IDs, file paths and statuses. Rows migrated from schema 1 start with technical validation `PENDING` and can be backfilled with checksums. Migration 003 adds review state, current annotation, and review round to `video_samples`. Existing samples start in review state `PENDING`, retain their assigned sign, and gain no approval through migration. Video files stay in the filesystem.
+SQLite enforces foreign keys on every connection. Migration 002 copies existing sample rows into the extended schema inside a transaction and preserves IDs, file paths and statuses. Rows migrated from schema 1 start with technical validation `PENDING` and can be backfilled with checksums. Migration 003 adds review state, current annotation, and review round to `video_samples`. Existing samples start in review state `PENDING`, retain their assigned sign, and gain no approval through migration. Migration 004 adds export snapshots and lifecycle auditing. Video files stay in the filesystem.
 
 Sidecars hold the original capture or import provenance, video stream metadata, SHA-256, and the initial validation report. `average_fps` and `nominal_fps` describe the stored video. Camera timing fields such as `requested_fps`, `measured_fps` and `actual_duration_seconds` describe the capture. Imports leave those fields empty. A supplied import recording timestamp is normalized to UTC. Without one, `recorded_at` remains empty and the original container creation timestamp is recorded separately when available. Following consent withdrawal and a fresh grant, ingestion requires a verified recording timestamp after that grant.
 
@@ -306,6 +310,128 @@ python cli.py stats --approved-coverage
 
 Summary totals include all registered records, recorded duration in seconds, and recorded video size in bytes. Coverage counts `CAPTURED` and `APPROVED` samples from signers with current granted consent. It shows collected samples and unique signers per vocabulary entry, entries with zero registrations, and active signs below their targets. Signer underrepresentation uses the supplied minimum for active signers with granted consent. The default minimum is one. Collection coverage counts original assignments. Approved coverage shows those assignments alongside verified labels and training-eligible counts. Review completion uses current finalized decisions divided by annotated samples. Approval and rejection rates use current finalized outcomes. Agreement compares only rounds with two independent verdicts on the same annotation and round, excluding adjudication. The agreement percentage is empty when there are no comparable rounds.
 
+## Export versioned datasets
+
+Export pulls from the current approved annotation. The original capture label and path stay in the registry. Eligible samples have granted training consent, a current approval under the applicable review policy, passed technical validation, an active verified sign, and a source video that matches its registered SHA-256. Run `registry backfill-hashes` for eligible legacy samples that lack a registered checksum. The export preview lists excluded samples and their reasons.
+
+```bash
+python cli.py dataset export --name ugsl-isolated-signs --version 1.0.0 --mode reference --dry-run
+python cli.py dataset export --name ugsl-isolated-signs --version 1.0.0 --mode reference
+python cli.py dataset export --name ugsl-isolated-signs --bump minor --mode portable --csv
+python cli.py dataset export --name ugsl-basic --sign UGSL0001 --sign UGSL0002 \
+  --min-samples-per-sign 10 --min-signers-per-sign 3
+python cli.py dataset list
+python cli.py dataset show ugsl-isolated-signs --version 1.0.0
+python cli.py dataset stats ugsl-isolated-signs --version 1.0.0
+```
+
+Use `--version` for explicit SemVer or `--bump patch|minor|major` for an operator-selected increment. A new name starts at `1.0.0`. Omit both options after that to increment the patch. Failed and revoked version numbers remain reserved. The manifest schema version is independent of the dataset version.
+
+`--sign`, `--category`, `--signer`, and `--session` can be repeated. Sign filters use verified IDs. A signer filter accepts a pseudonymous code or UUID. Coverage applies to explicitly requested signs and categories, including zero-sample classes. Without a sign or category filter it applies to the represented classes. An unmet threshold blocks export unless `--allow-incomplete-coverage` is given. Every export needs at least one eligible sample. Use `--exclude-warnings` to omit samples that passed with technical warnings. With `--max-samples-per-sign`, the lexically lowest sample UUIDs are selected within each verified sign. No other balancing is performed.
+
+Dry-run does not reserve versions or write artifacts. Disabling `--verify-all-source-checksums` omits the extra checksum pass over selection candidates in a real export. Artifact verification and the final checks on selected source bytes remain mandatory.
+
+### Reference and portable storage
+
+The default destination is `exports/` beside the raw dataset. Use `--output-directory` to change it. Reference exports resolve relative video paths from the selected `--storage-root`, which defaults to the raw directory. They depend on access to that original storage. Portable exports check disk space and copy the original encoded video bytes and extensions. They can move between directories or machines with no change to the manifest.
+
+```text
+datasets/exports/ugsl-isolated-signs-v1.1.0/
+├── dataset.json
+├── manifest.jsonl
+├── manifest.csv          # If requested
+├── vocabulary.json
+├── statistics.json
+├── checksums.sha256
+├── README.md
+└── videos/               # Portable mode
+    └── UGSL0001/
+        └── <sample-uuid>.mp4
+```
+
+JSON Lines is authoritative. Below is one example record, formatted across several lines for readability. A real manifest stores each record on one line.
+
+```json
+{
+  "sample_id": "ec8873a6-841d-45ca-a5e4-716998e819f0",
+  "sign_id": "UGSL0001",
+  "gloss": "WATER",
+  "class_index": 0,
+  "signer_id": "SIGNER001",
+  "session_id": "d5e6b52e-65cf-4544-b62f-88f029494471",
+  "video_path": "videos/UGSL0001/ec8873a6-841d-45ca-a5e4-716998e819f0.mp4",
+  "sha256": "1dc5b41c675d7c020d665c2d96f5b66c91774c7e80a9c50a351d9ca5debfdd02",
+  "container_format": "mov,mp4,m4a,3gp,3g2,mj2",
+  "video_codec": "mpeg4",
+  "width": 1280,
+  "height": 720,
+  "average_fps": 30.0,
+  "frame_count": 90,
+  "duration_ms": 3000,
+  "orientation": "LANDSCAPE",
+  "rotation": null,
+  "annotation": {
+    "id": "8dab297a-e01d-46bf-b448-8ffe09d40633",
+    "version": 2,
+    "start_ms": 500,
+    "end_ms": 2400,
+    "hand_usage": "TWO_HANDED",
+    "dominant_hand": "RIGHT",
+    "movement_type": "DYNAMIC",
+    "facial_expression": "UNKNOWN",
+    "completeness": "COMPLETE",
+    "confidence": 0.9
+  },
+  "technical_validation_status": "PASSED",
+  "source_type": "CAMERA",
+  "recorded_at": "2026-11-22T09:00:00+00:00",
+  "file_size_bytes": 1500000
+}
+```
+
+Classes are indexed from zero in permanent sign-ID order. Indices may change between exports. Keep the exact `vocabulary.json` from the training dataset with any model that uses its class indices. The content fingerprint includes the ordered records, annotation versions, class mapping, and effective selection options. Dataset UUIDs, timestamps, dataset version labels, and storage paths are outside that fingerprint. Reference and portable versions can therefore represent equivalent training content. Reports distinguish video bytes represented by a dataset from extra disk space needed for portable copying.
+
+### Verify, compare, and read
+
+```bash
+python cli.py dataset verify ugsl-isolated-signs --version 1.0.0
+python cli.py dataset verify --path ./datasets/exports/ugsl-isolated-signs-v1.1.0
+python cli.py dataset compare ugsl-isolated-signs --from-version 1.0.0 --to-version 1.1.0 --json
+```
+
+For a reference path verification, pass `--storage-root` if the export uses a different root from `--dataset-root`. Add `--registry PATH` (or the global `--db` option) to consult a registry for a moved dataset. Integrity verification checks artifact and video checksums, schema, vocabulary, annotation bounds, totals, and registered membership when available. Permission is reported separately. An intact dataset can be revoked. Standalone verification with no registry or revocation notice reports lifecycle permission as unknown.
+
+```python
+from dataset_export.reader import DatasetReader
+
+dataset = DatasetReader(
+    "datasets/exports/ugsl-isolated-signs-v1.1.0",
+    registry_path="datasets/registry.db",
+)
+for sample in dataset.iter_samples(sign_id="UGSL0001"):
+    print(sample.sample_id, sample.sign_id, sample.video_path)
+    print(sample.annotation.start_ms, sample.annotation.end_ms)
+```
+
+For reference exports, supply `storage_root=` or set `UGSL_REFERENCE_ROOT`. The reader checks essential manifest fields and known lifecycle status. Run the verifier for full artifact and video integrity. It rejects revoked versions when the registry or a matching revocation notice is available. A portable reader can consume a copy offline without a registry when there is no known revocation. In that case obtain current permission before use or redistribution. The reader uses the standard library and yields paths and metadata.
+
+### Lifecycle and recovery
+
+```bash
+python cli.py dataset supersede ugsl-isolated-signs --version 1.0.0
+python cli.py dataset affected --signer SIGNER001
+python cli.py dataset affected --sample SAMPLE_ID
+python cli.py dataset revoke ugsl-isolated-signs --version 1.1.0 --reason "Signer consent withdrawn"
+python cli.py dataset reconcile --dry-run
+python cli.py dataset reconcile
+```
+
+Superseded versions remain available for historical reproducibility. Consent loss, an invalidated approval or technical result, a changed registered checksum, or deactivation of a verified vocabulary entry revokes affected versions in the same registry transaction. Reapproval or a fresh consent grant does not reactivate revoked versions. Export a new version for the replacement dataset.
+
+The registry is authoritative. Explicit revocation and the CLI consent and correction commands write local notices when possible. Reconciliation writes missing notices to registered export folders. The separate `revocation.json` notice is outside the artifact checksums, so revocation preserves the manifest and its integrity. Send the notice to recipients when a dataset leaves the registry host. Use `dataset affected` to identify known portable copies. Stop using those copies and coordinate removal of exported media and any dependent artifacts with the custodian. Copies stored elsewhere and later training artifacts require a separate inventory.
+
+A new export reserves its version and membership in `BUILDING`, writes and verifies a private staging folder, then rechecks approval and consent before renaming and activating it. A build marker blocks use until activation finishes. Reconciliation can finalize a complete eligible build or mark an incomplete build `FAILED`. Staged files from failed or revoked builds remain private for inspection and custodian-directed cleanup. Dry-run performs no cleanup or lifecycle changes.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -315,6 +441,7 @@ Summary totals include all registered records, recorded duration in seconds, and
 | Requested local dimensions were ignored | The backend can choose another mode. Check the actual dimensions in preview or metadata. Request an even-sized supported mode for MP4 output. |
 | Preview keys appear unresponsive | Focus the OpenCV window. While it says **Preparing review**, wait for encoding and validation. |
 | Writer or storage error | Check write access and available space for the dataset and its staging directory. |
+| Interrupted dataset build | Run `dataset reconcile --dry-run`, inspect the report, then run `dataset reconcile`. |
 | Registry error after accepting a take | Keep the session active and run `registry reconcile --dry-run`, then `registry reconcile`. |
 | FFmpeg or FFprobe unavailable | Install both executables and check PATH. Resolve the issue before retrying staged ingestion. |
 | Technical rejection | Run `video validate` for the check results. Check framing, capture length, FPS, and resolution for a new take. |
@@ -357,3 +484,12 @@ Use a fresh test database and raw dataset directory. Set `UGSL_REGISTRY_DB` and 
 4. [ ] Approve the current version, then reopen it. Check that the saved annotation remains current and the older approval no longer counts.
 5. [ ] Set `UGSL_REVIEW_POLICY=DUAL`. Confirm the author cannot approve their own annotation. Have a different reviewer reject, a second independent reviewer approve, and an adjudicator resolve the conflict. Check that the two opinions and the adjudication are all in review history.
 6. [ ] Run the annotation, review, and approved-coverage statistics. Check the distinction between original and verified labels. Withdraw the test signer’s consent and confirm their video no longer appears in the queue or counts as training-eligible.
+
+### Phase 1.5 export checks
+
+1. [ ] Use a test registry with approved, pending, and excluded clips. Preview a reference export and check its exclusion reasons. Set an unreachable coverage threshold and confirm the export is blocked.
+2. [ ] Export a reference dataset and verify it against the configured raw root. Export a portable version with CSV, move a test copy, and verify it without the registry. Compare its video SHA-256 with the original.
+3. [ ] Export the same selection again and compare versions. Confirm matching fingerprints, class mappings, and annotation versions. Correct and reapprove a sample, then export a replacement and check that comparison reports the changed annotation.
+4. [ ] Modify a video copy in a disposable export and confirm integrity verification fails. Confirm a missing reference video is also reported.
+5. [ ] Withdraw the test signer's consent. Use `dataset affected` to find the versions, verify that an intact revoked version reports use blocked, and confirm the reader refuses it with the registry or revocation notice. Check that finalized manifest hashes are unchanged.
+6. [ ] Run `dataset reconcile --dry-run` before reconciling any interrupted test export. Confirm incomplete builds stay unavailable. Confirm a complete recoverable build reports the proposed activation without changing the registry in dry-run mode.
