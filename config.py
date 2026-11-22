@@ -115,3 +115,28 @@ class QualityConfig:
     @property
     def max_file_size_bytes(self) -> int:
         return int(self.max_file_size_mb * 1024**2)
+
+
+@dataclass(frozen=True)
+class ReviewConfig:
+    policy: str = "SINGLE"
+    confidence_min: float = 0.0
+    confidence_max: float = 1.0
+
+    def __post_init__(self) -> None:
+        policy = self.policy.strip().upper()
+        if policy not in {"SINGLE", "DUAL"}:
+            raise ValueError("Review policy must be SINGLE or DUAL.")
+        object.__setattr__(self, "policy", policy)
+        if not (math.isfinite(self.confidence_min) and math.isfinite(self.confidence_max)
+                and self.confidence_min < self.confidence_max):
+            raise ValueError("Annotation confidence requires a finite increasing range.")
+
+    @classmethod
+    def from_environment(cls) -> "ReviewConfig":
+        try:
+            minimum = float(os.environ.get("UGSL_ANNOTATION_CONFIDENCE_MIN", "0"))
+            maximum = float(os.environ.get("UGSL_ANNOTATION_CONFIDENCE_MAX", "1"))
+        except ValueError as exc:
+            raise ValueError("Annotation confidence limits must be numbers.") from exc
+        return cls(os.environ.get("UGSL_REVIEW_POLICY", "SINGLE"), minimum, maximum)

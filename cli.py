@@ -6,6 +6,7 @@ from typing import Annotated
 
 import typer
 
+from annotation import commands as linguistic_commands
 from config import DATASET_ROOT, REGISTRY_PATH, CaptureConfig, validate_identifier
 from ingestion import commands as media_commands
 from ingestion.capture import CameraCapture
@@ -18,6 +19,7 @@ app = typer.Typer(help="Capture and manage the UGSL training dataset.", no_args_
 DEFAULTS = CaptureConfig()
 commands.mount(app)
 media_commands.mount(app)
+linguistic_commands.mount(app)
 
 
 @app.callback()

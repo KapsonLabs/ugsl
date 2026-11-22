@@ -85,3 +85,6 @@ class VideoSample:
     technical_validation_status: str = "PENDING"
     technical_validated_at: str | None = None
     validator_version: str | None = None
+    review_state: str = "PENDING"
+    current_annotation_id: str | None = None
+    review_round: int = 1

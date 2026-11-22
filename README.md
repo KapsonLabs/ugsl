@@ -1,6 +1,6 @@
-# UGSL Recognition Engine · Phase 1.3
+# UGSL Recognition Engine · Phase 1.4
 
-Collect labelled Ugandan Sign Language video samples and manage the dataset in a local SQLite registry. Operators record takes in OpenCV or import existing local video files. Both paths run through the same technical checks before storing the original video bytes and registering the sample. The registry links each sample to a vocabulary entry and a recording session for an eligible signer.
+Collect labelled Ugandan Sign Language video samples and manage the dataset in a local SQLite registry. Operators record takes in OpenCV or import existing local video files. Both paths run through the same technical checks before storing the original video bytes and registering the sample. The registry links each sample to a vocabulary entry and a recording session for an eligible signer. Human annotators mark the sign interval, and linguistic reviewers verify the annotation before the sample becomes training-eligible.
 
 ## Install
 
@@ -191,13 +191,17 @@ datasets/
 | `video_samples` | Sample UUID, sign/session links, relative paths, source, unique SHA-256, stream metadata, capture metrics, and separate technical and linguistic statuses |
 | `video_validations` | Versioned technical and visual reports with a timestamp, profile, metrics, errors, and warnings |
 | `ingestion_attempts` | Batch ID, source reference, optional sample ID and SHA-256, outcome, error details, and attempt timestamps. Includes failed attempts without a sample |
+| `reviewers` | Local reviewer code, declared proficiency and role, optional qualification notes, and active status |
+| `annotations` | Immutable sign and interval versions linked to the sample, annotator, and prior version |
+| `review_decisions` | Append-only reviewer decisions scoped to an annotation version and review round, with reasons and adjudication flags |
+| `review_events` | Review start, reopen, and variant-request history |
 | `sign_sequence` | Counter used to allocate permanent vocabulary IDs |
 
-SQLite enforces foreign keys on every connection. Migration 002 copies existing sample rows into the extended schema inside a transaction and preserves IDs, file paths and statuses. Existing rows start with technical validation `PENDING` and an empty checksum until backfilled. Video files stay in the filesystem.
+SQLite enforces foreign keys on every connection. Migration 002 copies existing sample rows into the extended schema inside a transaction and preserves IDs, file paths and statuses. Rows migrated from schema 1 start with technical validation `PENDING` and can be backfilled with checksums. Migration 003 adds review state, current annotation, and review round to `video_samples`. Existing samples start in review state `PENDING`, retain their assigned sign, and gain no approval through migration. Video files stay in the filesystem.
 
 Sidecars hold the original capture or import provenance, video stream metadata, SHA-256, and the initial validation report. `average_fps` and `nominal_fps` describe the stored video. Camera timing fields such as `requested_fps`, `measured_fps` and `actual_duration_seconds` describe the capture. Imports leave those fields empty. A supplied import recording timestamp is normalized to UTC. Without one, `recorded_at` remains empty and the original container creation timestamp is recorded separately when available. Following consent withdrawal and a fresh grant, ingestion requires a verified recording timestamp after that grant.
 
-Registered camera capture preserves the review and replay controls. A submits the staged take to the shared ingestion service. A technical rejection or duplicate returns to Ready at the same repetition. The repetition advances after registration. New samples enter `CAPTURED`, including those with visual warnings. Linguistic review is a later phase.
+Registered camera capture preserves the review and replay controls. A submits the staged take to the shared ingestion service. A technical rejection or duplicate returns to Ready at the same repetition. The repetition advances after registration. New samples enter `CAPTURED`, including those with visual warnings. Linguistic review is a separate step after ingestion.
 
 OpenCV’s constant-rate MP4V writer encodes at the measured capture rate so playback is close to the real duration. Irregular frame arrival times are spread across the clip. The full frame is preserved and overlays appear only in preview. Three seconds at 720p and 30 FPS requires about 237 MiB of temporary frame storage in addition to the MP4.
 
@@ -225,6 +229,67 @@ python cli.py registry sync --session SESSION_ID --sign UGSL0001
 
 Quarantine is opt-in for external imports via `--quarantine`. It keeps a restricted copy of a staged technical rejection only when consent permits it. The default retention window is seven days. Reconciliation reports expired copies and copies that lack current consent. Preview with `registry reconcile --dry-run --purge-quarantine` before explicitly removing them with `registry reconcile --purge-quarantine`. External source files remain in place.
 
+## Annotation and linguistic review
+
+Register the people who will annotate and verify isolated signs. Reviewer codes provide local accountability. The operator is responsible for checking qualifications before assigning a role or proficiency.
+
+```bash
+python cli.py reviewer add --code REVIEWER001 --proficiency fluent --role reviewer
+python cli.py reviewer list
+python cli.py reviewer show REVIEWER001
+python cli.py annotation queue --sign UGSL0001 --status pending
+python cli.py annotation open SAMPLE_ID --reviewer REVIEWER001
+python cli.py annotation run --reviewer REVIEWER001 --sign UGSL0001 --priority
+```
+
+Replace `SAMPLE_ID` with the actual UUID shown in the queue. The queue includes technically passed, accessible recordings with current granted signer consent. `--sign` matches either the assigned sign or the current annotated sign. Other filters include signer code or UUID, session, technical status, review state, current annotation author or review participant, and source (`CAMERA`, `IMPORT`, `LOCAL`, or `REMOTE`). `--since` and `--until` use UTC registration dates. Select `--order oldest`, `newest`, or `sign`. `--priority` puts second review and correction first.
+
+### Annotation window
+
+Focus the OpenCV window to use the keyboard. When it directs you to the terminal, playback pauses while you enter a sign ID, rejection code, or other details.
+
+| Key | Action |
+| --- | --- |
+| Space | Pause or resume |
+| Left / Right | Move one decoded frame backward or forward |
+| J / L | Seek backward or forward by about 500 milliseconds |
+| I / O | Mark the sign start or end. O uses the end of the clip when the final frame is displayed |
+| P | Replay the marked interval |
+| + / − | Change playback speed through 0.25×, 0.5×, 1×, and 2× |
+| S | Save the marked interval, with an optional label change |
+| A | Approve the saved current annotation |
+| R | Reject with a standard reason code |
+| U | Request second review |
+| N / Q | Move to the next eligible sample or exit. The tool asks before discarding an unsaved draft |
+
+The overlay shows the original gloss, current annotation or variant, signer code, duration, position, frame number, markers, speed, review state, and technical warnings. FFprobe supplies source presentation timestamps relative to the first displayed frame. OpenCV decodes in sequence and restarts from the beginning to step backward, which can take longer for clips with many frames. On variable-rate clips, seeks land on an available presentation timestamp. Timing marks use integer milliseconds and represent one interval in the original video. The tool reports media whose backend cannot supply a usable presentation timeline or decode the requested frame. Saved annotations survive interruption. Overlays and boundaries stay separate from the original video.
+
+### Manual annotation, correction, and review
+
+```bash
+python cli.py annotation create SAMPLE_ID --reviewer REVIEWER001 --sign UGSL0001 \
+  --start-ms 500 --end-ms 2400 --hand-usage two-handed --movement-type dynamic
+python cli.py review start SAMPLE_ID --reviewer REVIEWER001
+python cli.py review approve SAMPLE_ID --reviewer REVIEWER001
+python cli.py review reject SAMPLE_ID --reviewer REVIEWER001 --reason incomplete-sign
+python cli.py review request-correction SAMPLE_ID --reviewer REVIEWER001 --reason invalid-temporal-boundaries
+python cli.py review request-second SAMPLE_ID --reviewer REVIEWER001 --notes "Verify regional variation"
+python cli.py review reopen SAMPLE_ID --reviewer REVIEWER001 --reason "Check the end boundary"
+python cli.py annotation correct SAMPLE_ID --reviewer REVIEWER001 --sign UGSL0002 --reason "Verified regional variant"
+python cli.py annotation request-variant SAMPLE_ID --reviewer REVIEWER001 --notes "Ask the vocabulary team to review this variant"
+python cli.py annotation history SAMPLE_ID
+python cli.py review history SAMPLE_ID
+python cli.py sample eligibility SAMPLE_ID
+```
+
+The review commands shown are alternatives for the current state. An annotation advances from `PENDING` to `ANNOTATED` on save. A reviewer can start review explicitly, approve or reject, request a corrected version, or ask for independent review. Corrections create a new version and require a reason. If the initial annotation changes the assigned sign, provide `--reason` when creating it. Select a registered variant by sign ID. Variant requests preserve notes for the vocabulary team. The original sign assignment and video path stay intact.
+
+Review decisions require an active reviewer or adjudicator with declared proficiency of `FLUENT`, `NATIVE`, or `QUALIFIED_INTERPRETER`. The default `SINGLE` policy allows the same qualified reviewer to annotate and approve. Set `UGSL_REVIEW_POLICY=DUAL` to require a different reviewer for verification. Under dual review, an initial rejection calls for independent confirmation. If the independent verdicts disagree, a third reviewer with the `ADJUDICATOR` role resolves the conflict or requests a correction. The original annotator and the conflicting voters cannot adjudicate that round. Explicit requests for second review also route to a different reviewer. Use one policy consistently across terminals.
+
+Confidence is a human score. The default range is 0–1 and can be configured with `UGSL_ANNOTATION_CONFIDENCE_MIN` and `UGSL_ANNOTATION_CONFIDENCE_MAX`. A CLI decision can include `--annotation-id` and `--round` to guard against a stale version or review round. The annotation window supplies both automatically.
+
+Reopening an approval starts a fresh round on the same annotation. Correcting an annotation starts a fresh round on a new version. Either action returns the sample to `CAPTURED` pending approval. Training eligibility checks current consent, readable media and integrity, passed technical validation, and a final approval for the current version and round under the applicable policy. The approved annotation supplies the verified sign ID. A withdrawn signer’s samples remain `EXCLUDED`, with their history retained.
+
 ## Statistics
 
 ```bash
@@ -234,9 +299,12 @@ python cli.py stats --by signer
 python cli.py stats --by session
 python cli.py stats --by status
 python cli.py stats --coverage --min-signer-samples 5
+python cli.py stats --annotations
+python cli.py stats --reviews
+python cli.py stats --approved-coverage
 ```
 
-Summary totals include all registered records, recorded duration in seconds, and recorded video size in bytes. Coverage counts `CAPTURED` and `APPROVED` samples from signers with current granted consent. It shows collected samples and unique signers per vocabulary entry, entries with zero registrations, and active signs below their targets. Signer underrepresentation uses the supplied minimum for active signers with granted consent. The default minimum is one.
+Summary totals include all registered records, recorded duration in seconds, and recorded video size in bytes. Coverage counts `CAPTURED` and `APPROVED` samples from signers with current granted consent. It shows collected samples and unique signers per vocabulary entry, entries with zero registrations, and active signs below their targets. Signer underrepresentation uses the supplied minimum for active signers with granted consent. The default minimum is one. Collection coverage counts original assignments. Approved coverage shows those assignments alongside verified labels and training-eligible counts. Review completion uses current finalized decisions divided by annotated samples. Approval and rejection rates use current finalized outcomes. Agreement compares only rounds with two independent verdicts on the same annotation and round, excluding adjudication. The agreement percentage is empty when there are no comparable rounds.
 
 ## Troubleshooting
 
@@ -280,3 +348,12 @@ Use a fresh test database and raw dataset directory. Set `UGSL_REGISTRY_DB` and 
 4. [ ] Dry-run a manifest containing valid, duplicate and corrupt files. Confirm the result summary and that dry-run creates no files or records. Run the real batch and confirm valid rows continue past invalid entries.
 5. [ ] Record an otherwise valid take under the default profile with a duration below one second. Accept it and confirm the technical rejection returns you to the same repetition. Accept a valid longer take and check that it advances. Repeat on a remote camera when available.
 6. [ ] Run `registry backfill-hashes --dry-run`, `registry reconcile --dry-run`, and `sample validate-all --dry-run`. Review any duplicate groups or orphans. Check `sample list --validation-status failed` after a persisted revalidation of a failed test sample.
+
+### Phase 1.4 annotation checks
+
+1. [ ] In your test dataset, validate or ingest a clip with a known sign interval. Register a qualified reviewer and confirm the clip appears in `annotation queue --status pending`. Confirm a technically failed clip stays out of the queue.
+2. [ ] Open the clip. Use Left and Right to step through it, use J and L to seek, change speed, mark the boundaries with I and O, and replay the interval with P. Try leaving an unsaved draft, decline the discard prompt, and save it with S. Confirm the original video checksum is unchanged.
+3. [ ] Approve under the default policy and check `sample eligibility`. Correct the annotation to a registered variant and confirm the original label and file path remain unchanged, both versions appear in history, and the sample needs fresh approval.
+4. [ ] Approve the current version, then reopen it. Check that the saved annotation remains current and the older approval no longer counts.
+5. [ ] Set `UGSL_REVIEW_POLICY=DUAL`. Confirm the author cannot approve their own annotation. Have a different reviewer reject, a second independent reviewer approve, and an adjudicator resolve the conflict. Check that the two opinions and the adjudication are all in review history.
+6. [ ] Run the annotation, review, and approved-coverage statistics. Check the distinction between original and verified labels. Withdraw the test signer’s consent and confirm their video no longer appears in the queue or counts as training-eligible.

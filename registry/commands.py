@@ -7,6 +7,7 @@ from typing import Annotated
 
 import typer
 
+from config import ReviewConfig
 from ingestion.exceptions import MediaError
 from registry import samples, sessions, signers, statistics, vocabulary
 from registry.database import Database, RegistryError
@@ -253,7 +254,7 @@ def sample_list(
     rows = samples.list_samples(database(ctx), sign_id=sign, session_id=session, status=status,
                                 validation_status=validation_status)
     _table([asdict(row) for row in rows],
-           ("id", "sign_id", "session_id", "status", "technical_validation_status", "file_path"))
+           ("id", "sign_id", "session_id", "status", "technical_validation_status", "review_state", "file_path"))
 
 
 @sample_app.command("show")
@@ -287,6 +288,9 @@ def stats(
     by: Annotated[str | None, typer.Option(help="Group by sign, signer, session or status.")] = None,
     coverage: Annotated[bool, typer.Option(help="Show vocabulary collection progress.")] = False,
     min_signer_samples: Annotated[int, typer.Option(help="Coverage threshold for eligible signers.")] = 1,
+    annotations: Annotated[bool, typer.Option(help="Show annotation and correction counts.")] = False,
+    reviews: Annotated[bool, typer.Option(help="Show review outcomes and reviewer activity.")] = False,
+    approved_coverage: Annotated[bool, typer.Option(help="Show verified coverage and training eligibility.")] = False,
 ):
     db = database(ctx)
     if by:
@@ -301,7 +305,27 @@ def stats(
         _table(report.underrepresented_signs, ("id", "gloss", "variant", "collected", "target_samples"))
         typer.echo(f"\nEligible signers below {min_signer_samples} samples")
         _table(report.underrepresented_signers)
-    if not by and not coverage:
+    if annotations or reviews or approved_coverage:
+        try:
+            review_config = ReviewConfig.from_environment()
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        report = statistics.annotation_statistics(db, ctx.obj.dataset_root, review_config)
+        if annotations or reviews:
+            _table([{"metric": name.replace("_", " "), "value": value} for name, value in report.counts.items()])
+        if reviews:
+            typer.echo("\nRejection reasons")
+            _table(report.rejection_reasons)
+            typer.echo("\nReviewer activity")
+            _table(report.reviewer_activity)
+            typer.echo("\nAgreement between independent reviewers")
+            _table([report.agreement])
+        if approved_coverage:
+            typer.echo("Approved coverage by sign")
+            _table(report.approved_by_sign)
+            typer.echo("\nApproved coverage by signer")
+            _table(report.approved_by_signer)
+    if not by and not coverage and not (annotations or reviews or approved_coverage):
         summary = asdict(statistics.summary(db))
         summary["footage_seconds"] = f"{summary['footage_seconds']:.2f}"
         _table([{"metric": key.replace("_", " "), "value": value} for key, value in summary.items()])
