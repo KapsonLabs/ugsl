@@ -5,3 +5,5 @@ ug_env/
 datasets/.capture-*/
 datasets/raw/*
 !datasets/raw/.gitkeep
+datasets/registry.db*
+datasets/standalone/

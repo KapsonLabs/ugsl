@@ -15,12 +15,21 @@ class RecordingState(StrEnum):
 
 
 @dataclass(frozen=True)
+class RecordingContext:
+    """Optional labels carried by an accepted take for later reconciliation."""
+
+    sign_id: str
+    session_id: str
+    gloss: str
+
+
+@dataclass(frozen=True)
 class RecordingMetadata:
     sample_id: str
     gloss: str
     signer_id: str
     repetition: int
-    camera_index: int
+    camera_index: int | None
     width: int
     height: int
     requested_fps: float
@@ -33,3 +42,5 @@ class RecordingMetadata:
     file_size_bytes: int
     file_path: str
     recorded_at: str
+    sign_id: str | None = None
+    session_id: str | None = None

@@ -2,10 +2,12 @@
 
 import math
 import re
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from pathlib import Path
 
 DATASET_ROOT = Path("datasets/raw")
+REGISTRY_PATH = Path("datasets/registry.db")
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 
@@ -27,6 +29,7 @@ class CaptureConfig:
     countdown: float = 3
     repetitions: int = 1
     codec: str = "mp4v"
+    source: str | None = None
 
     def __post_init__(self) -> None:
         for name, value, minimum in (
@@ -52,3 +55,16 @@ class CaptureConfig:
 
         if not isinstance(self.codec, str) or not re.fullmatch(r"[A-Za-z0-9]{4}", self.codec):
             raise ValueError("Codec must be a four-character ASCII code.")
+
+        if self.source is not None:
+            try:
+                url = urlsplit(self.source)
+                port = url.port
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError("Provide a valid remote camera URL.") from exc
+            if (
+                url.scheme not in {"http", "https", "rtsp", "rtsps"} or not url.hostname
+                or port == 0 or any(c.isspace() or ord(c) < 32 for c in self.source)
+                or url.username is not None or url.password is not None
+            ):
+                raise ValueError("Provide an HTTP(S) or RTSP(S) camera URL without embedded credentials.")

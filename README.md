@@ -1,10 +1,10 @@
-# UGSL Recognition Engine · Phase 1.1
+# UGSL Recognition Engine · Phase 1.2
 
-Collect labelled video samples for a Ugandan Sign Language training dataset. An operator frames the signer, starts a timed take, reviews it, and decides whether to add it to the local dataset. The CLI returns after the requested number of samples has been accepted or the operator quits.
+Collect labelled Ugandan Sign Language video samples and manage the dataset in a local SQLite registry. Operators record and review each take in OpenCV. The registry links accepted video files to vocabulary entries and recording sessions for registered signers.
 
-## Installation
+## Install
 
-Use Python 3.11 or newer on a macOS or Linux desktop with an attached camera. Run the commands from the project directory.
+Use Python 3.11 or newer on a macOS or Linux desktop. Run these commands from the project directory.
 
 ```bash
 python3 -m venv .venv
@@ -12,82 +12,172 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-The preview uses the GUI-enabled `opencv-python` package and requires a graphical desktop session.
+The preview requires the GUI-enabled OpenCV package and a graphical desktop. On macOS, grant camera access when prompted. If permission was denied, open **System Settings → Privacy & Security → Camera** and enable access for the app launching Python. [Apple’s camera permission guide](https://support.apple.com/en-lk/guide/mac-help/mchlf6d108da/mac)
 
-### macOS camera permissions
+The CLI initializes `datasets/registry.db` when a registry operation first needs it. Override the database and raw dataset paths using global options before the command or using environment variables.
 
-Allow camera access when macOS prompts. If access was previously denied, open **System Settings → Privacy & Security → Camera**, enable access for the terminal or other app launching Python if it appears in the list, and rerun the command. [Apple’s camera permission guide](https://support.apple.com/en-lk/guide/mac-help/mchlf6d108da/mac)
+```bash
+python cli.py --db /path/to/registry.db --dataset-root /path/to/raw stats
+export UGSL_REGISTRY_DB=/path/to/registry.db
+export UGSL_DATASET_ROOT=/path/to/raw
+```
 
-## Usage
+Use the same database and dataset root together. Registry paths are relative to that root.
+
+## Register signs and signers
+
+```bash
+python cli.py sign add --gloss WATER --category "Food and drinks" --type dynamic --target-samples 100
+python cli.py sign add --gloss WATER --variant CENTRAL --type dynamic
+python cli.py sign list --category "Food and drinks" --type dynamic --active
+python cli.py sign show UGSL0001
+python cli.py sign update UGSL0001 --target-samples 150
+python cli.py sign deactivate UGSL0002
+
+python cli.py signer add --code SIGNER001 --dominant-hand right --proficiency fluent
+python cli.py signer consent SIGNER001 --status granted --reference CONSENT001
+python cli.py signer list
+python cli.py signer show SIGNER001
+python cli.py signer update SIGNER001 --region Central
+```
+
+Have UGSL experts establish vocabulary entries, meanings, and variants. The registry normalizes glosses for lookup and gives every entry its own permanent ID. A shared English gloss can identify multiple entries with distinct variant labels. Categories are free text. Renaming a gloss leaves its ID, sample links, and file paths intact.
+
+Use a pseudonymous signer code and an opaque consent reference. Store consent documents separately. Signers start with `UNKNOWN` consent, and only active signers with granted consent can contribute training recordings. To deactivate a signer, run `python cli.py signer deactivate SIGNER001`.
+
+### Consent withdrawal
+
+```bash
+python cli.py signer withdraw SIGNER001 --reference WITHDRAWAL001
+python cli.py sample list --status excluded
+```
+
+Withdrawal records the consent change, marks the signer’s registered samples `EXCLUDED`, and reports the affected MP4 and JSON paths for retention decisions. Files stay on disk. A subsequent grant permits fresh recordings while previously excluded samples stay excluded. Synchronization also blocks previously unregistered samples that predate that fresh grant. Check any saved-but-unregistered files separately when handling withdrawal.
+
+## Preview and record
 
 ```bash
 python cli.py preview --camera 0
-python cli.py capture --sign WATER --signer SIGNER001 --duration 3
-python cli.py capture --sign WATER --signer SIGNER001 --duration 3 --repetitions 10
-python cli.py capture --sign WATER --signer SIGNER001 --camera 0 \
-  --width 1280 --height 720 --fps 30 --duration 5 --countdown 3 --repetitions 10
+python cli.py session create --signer SIGNER001 --camera-type local --angle front --lighting natural
+python cli.py session list
+python cli.py session show SESSION_ID
+python cli.py capture --sign UGSL0001 --session SESSION_ID --camera 0 --duration 3 --repetitions 10
+python cli.py sample list --sign UGSL0001
+python cli.py sample show SAMPLE_ID
+python cli.py session complete SESSION_ID
 ```
 
-Defaults are camera index 0, 1280 × 720, 30 requested FPS, a three-second recording, a three-second countdown, and one accepted repetition. Set `--countdown 0` for an immediate start. Recordings use MP4 with the MPEG-4 Part 2 (`mp4v`) codec. Sign and signer labels are used as entered. Each label must start with an ASCII letter or digit and contain at most 64 ASCII letters, digits, underscores, or hyphens.
+Replace `SESSION_ID` with the ID printed by `session create` and `SAMPLE_ID` with a registered sample UUID. Record different signs by running `capture` again with the same active session ID and another sign ID. After checking the registered count, use `session complete` to close a finished session or `session cancel` to close an abandoned one. Both close the session to new samples and retain its existing records.
 
-Click the preview window before using its keys. Frame the signer’s head and upper body, and check that their hands stay in view throughout the sign.
+Local capture requests 1280 × 720 at 30 FPS by default. Camera mode, recording duration, countdown duration, and repetitions can be changed with `--width`, `--height`, `--fps`, `--duration`, `--countdown`, and `--repetitions`. Defaults are three seconds for recording, three seconds for countdown, and one accepted take. A zero countdown starts capture immediately.
 
-| Key | Where it works | Action |
+### Remote camera
+
+Use an `HTTP(S)` or `RTSP(S)` stream readable by the OpenCV FFmpeg backend. The remote stream supplies the frame dimensions and cadence. On a camera host, the bundled MJPEG sender can serve one client at a time. It binds to loopback by default and serves an unauthenticated stream, so use a trusted network and set the camera host’s LAN address explicitly if another machine needs to connect.
+
+```bash
+# On the camera host. Replace the address with that host's LAN address.
+python -m tools.camera_server --bind 192.168.1.105 --port 8080 --camera 0
+
+# On the recording workstation.
+python cli.py preview --source http://192.168.1.105:8080/stream
+python cli.py session create --signer SIGNER001 --camera-type remote --angle front --lighting natural
+python cli.py capture --sign UGSL0001 --session SESSION_ID \
+  --source http://192.168.1.105:8080/stream --duration 3 --repetitions 10
+```
+
+Close preview before capturing when using the bundled sender. Keep stream credentials out of camera URLs. The registry and sidecars contain no stream URL.
+
+### Standalone camera check
+
+The existing `--sign` and `--signer` syntax still works for standalone test recordings. They go to `datasets/standalone/` with default paths, outside the registry’s raw dataset scan.
+
+```bash
+python cli.py capture --sign CAMERA_TEST --signer TEST001 --duration 3 --repetitions 2
+```
+
+### Keyboard controls
+
+Focus the camera window before using the keys. Frame the signer’s head and upper body, keeping their hands visible throughout the sign.
+
+| Key | State | Action |
 | --- | --- | --- |
-| Space | Ready | Start a take |
-| Q | Preview or any active capture state | End the session and discard any unaccepted take |
+| Space | Ready | Start countdown and capture |
+| Q | Preview or active capture | Quit and discard the unaccepted take |
 | Esc | Countdown, recording, or review | Cancel the take and return to Ready |
-| Esc | Playback | Return to review |
-| A | Review | Save the take and advance the sample count |
-| R | Review | Discard the take and return to Ready at the same sample number |
-| P | Review | Replay the take and return to review |
+| Esc | Playback | Return to Review |
+| A | Review | Accept and save the take. Registered capture also writes its registry record |
+| R | Review | Reject the take and return to the same repetition |
+| P | Review | Replay the take |
 
-Press Space again after rejecting a take or when Ready for the next repetition. Terminal Ctrl+C also exits the application and runs session cleanup.
-
-## Dataset and metadata
-
-Each accepted take has a UUID shared by the video and its JSON sidecar. Repetition numbering starts at 1 each time a capture session starts.
+## Storage and schema
 
 ```text
-datasets/raw/
-└── WATER/
-    └── SIGNER001/
-        ├── <uuid>.mp4
-        └── <uuid>.json
+datasets/
+├── registry.db
+├── raw/
+│   └── UGSL0001/SIGNER001/
+│       ├── <uuid>.mp4
+│       └── <uuid>.json
+└── standalone/
+    └── CAMERA_TEST/TEST001/<uuid>.mp4
 ```
 
-| Fields | Meaning |
+| Table | Purpose |
 | --- | --- |
-| `sample_id`, `gloss`, `signer_id`, `repetition` | UUID, operator-provided labels and the accepted sample number in this session |
-| `camera_index`, `width`, `height` | Selected device index and actual video dimensions in pixels |
-| `requested_fps` | Frame rate requested from the camera |
-| `measured_fps` | Successful frames divided by the elapsed capture time, including transient read failures and capture-loop overhead |
-| `encoded_fps` | Playback rate reported when reopening the encoded MP4 |
-| `frame_count`, `failed_frame_reads` | Successful captures and unsuccessful camera reads during the take |
-| `requested_duration_seconds`, `actual_duration_seconds` | Target take length and elapsed monotonic capture time, excluding countdown, encoding, and review |
-| `file_size_bytes`, `file_path` | MP4 byte size and path. CLI paths are relative to the directory used to launch the command |
-| `recorded_at` | UTC timestamp at the start of the take in ISO 8601 format |
+| `signs` | Permanent sign ID, gloss, variant, category, description, type, target count, active flag, and timestamps |
+| `signers` | UUID, pseudonymous code, optional background attributes, current consent and reference, active flag, and timestamps |
+| `signer_consent_events` | Timestamped consent changes and optional references |
+| `recording_sessions` | UUID linked to one signer, operator, camera and environment details, notes, status, and start and end times |
+| `video_samples` | UUID shared with the files, sign and session foreign keys, sample type, repetition, relative paths, metrics, status, and timestamps |
+| `sign_sequence` | Counter used to allocate permanent vocabulary IDs |
 
-## How capture works
+SQLite enforces foreign keys on every connection. Versioned SQL in `registry/migrations/` runs transactionally and tracks its version with `PRAGMA user_version`. A unique constraint covers normalized gloss and variant. The sample UUID and video path also have unique constraints. The session determines the signer for each registered sample. Videos stay in the filesystem.
 
-- `config.py` defines settings and validates labels. `cli.py` exposes the two operator commands and reports device and storage errors.
-- `CameraCapture` in `ingestion/capture.py` requests a camera mode, checks that frames arrive, and uses the delivered dimensions. The session moves from Ready through Countdown and Recording to Review. Playback returns to Review. Accepting the final take completes the session.
-- The capture loop uses a monotonic clock. Frame retrieval can extend a take slightly beyond its target. Captured frames keep their original dimensions and orientation. The framing guide and labels are drawn on a separate preview image.
-- OpenCV’s writer uses a constant frame rate. The session checks that a writer can open before capture, stages the raw frames on disk, then encodes them at the measured average rate. This keeps total playback time close to elapsed capture time. Irregular inter-frame timing and gaps from failed reads are spread across the clip at uniform intervals, and the codec can round the requested encoding rate. MP4V compression is lossy.
-- Before offering review, the session reopens the MP4 and checks that every expected frame decodes at the correct dimensions. On acceptance it writes the metadata dataclass from `ingestion/schemas.py` to JSON and publishes the pair without replacing existing files. `ingestion/exceptions.py` defines errors that the CLI can report directly.
-- Temporary files live in a hidden `datasets/.capture-*` directory. Raw staging uses about 237 MiB for three seconds at 720p and 30 FPS, plus space for the encoded MP4. Allow time for encoding and validation when the window says **Preparing review**.
-- Cleanup runs on normal exit, exceptions, Ctrl+C, and CLI SIGTERM. A force kill or power loss can leave a temporary directory, or a JSON sidecar if interrupted between publishing the sidecar and the video. After confirming the session is no longer running, remove its stale temporary directory and any sidecar with a missing same-name MP4.
+The JSON sidecar records the camera index for local takes, the gloss at capture, the signer code, and the repetition within that invocation. Registered captures add stable sign and session IDs. It also records frame counts, failed reads, dimensions, MP4 byte size, requested and measured durations, and the UTC capture timestamp. `requested_fps` is the requested camera rate, `measured_fps` is successful frames divided by elapsed capture time, and `encoded_fps` is read back from the saved video.
+
+The camera workflow in `ingestion/` saves the accepted pair before invoking the callback from `services/recording_service.py`. The service rechecks eligibility before each take and inside the SQLite registration transaction. The repetition advances only after registration succeeds. Operator acceptance sets `CAPTURED`. Linguistic review will use `APPROVED` and `REJECTED` in a later phase.
+
+OpenCV’s constant-rate MP4V writer encodes at the measured capture rate so playback is close to the real duration. Irregular frame arrival times are spread across the clip. The full frame is preserved and overlays appear only in preview. Three seconds at 720p and 30 FPS requires about 237 MiB of temporary frame storage in addition to the MP4. Staging and accepted files need a filesystem with hard-link support. Use Q or terminal Ctrl+C for normal cleanup. After a force kill, check for stale `.capture-*` directories and orphaned sidecars once the session has stopped.
+
+## Synchronization and recovery
+
+```bash
+python cli.py registry sync --dry-run
+python cli.py registry sync
+python cli.py registry sync --session SESSION_ID
+python cli.py registry sync --session SESSION_ID --sign UGSL0001
+```
+
+Sync recursively scans the raw dataset directory for JSON sidecars and validates each same-name MP4 and its metadata. It preserves sample UUIDs and recording times and skips matching registrations on subsequent runs. A dry run reports proposed registrations without adding records, migrating the database, or creating it on disk.
+
+New sidecars identify their sign and session. For legacy sidecars, register the signer and sign first, record the signer’s consent separately, and use an active session for that signer. Sync infers a session when exactly one is active. Provide `--session` to resolve multiple active sessions and `--sign` for an ambiguous legacy gloss with several variants. The chosen sign must match the legacy gloss. Explicit selections that conflict with an unregistered sidecar are reported. Each sidecar’s recorded path must agree with its actual video location. The scan reports invalid metadata, missing media, unsafe paths, and unresolved references. Valid pairs are processed even if others fail, and the command exits with a nonzero status when there are issues.
+
+If registration fails after a take is accepted, the CLI reports its UUID and preserves the pair. Resolve the error, run sync, and inspect the sample before completing the session. Sync can register a saved pair once and report it as skipped on retries. Keep the session active until all recoverable files are registered.
+
+## Statistics
+
+```bash
+python cli.py stats
+python cli.py stats --by sign
+python cli.py stats --by signer
+python cli.py stats --by session
+python cli.py stats --by status
+python cli.py stats --coverage --min-signer-samples 5
+```
+
+Summary totals include all registered records, recorded duration in seconds, and recorded MP4 size in bytes. Coverage counts `CAPTURED` and `APPROVED` samples from signers with current granted consent. It shows collected samples and unique signers per vocabulary entry, entries with zero registrations, and active signs below their targets. Signer underrepresentation uses the supplied minimum for active signers with granted consent. The default minimum is one.
 
 ## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
-| Camera unavailable or black preview | Check camera permissions and connection, close other camera apps, and try a different `--camera` index. On Linux, check access to the corresponding `/dev/video*` device. |
-| Requested resolution was ignored | The camera backend can select another mode. Check the preview and the sidecar dimensions. Request a supported even-sized mode if recording reports an odd resolution. |
-| Preview window fails to open | Run from a graphical desktop with the GUI-enabled OpenCV package. |
-| Keyboard shortcuts appear unresponsive | Focus the preview window. During **Preparing review**, wait for the review controls to appear. |
-| Clip has stutter or low measured FPS | Compare requested, measured, and encoded FPS and check the failed read count. Try a lower supported resolution or improve lighting. Repeated frame-read failures end the session and discard the pending take. |
-| Writer or storage error | Check codec support, available disk space and write permission for `datasets/` and `datasets/raw/`. Staging and final directories need to be on the same filesystem with hard-link support. |
+| Local camera unavailable | Check camera permissions and index, close other camera apps, and on Linux check access to the corresponding `/dev/video*` device. |
+| Remote camera unavailable | Confirm the stream URL, host reachability, and that no other client is using the bundled sender. Check the server’s camera permissions. |
+| Requested local dimensions were ignored | The backend can choose another mode. Check the actual dimensions in preview or metadata. Request an even-sized supported mode for MP4 output. |
+| Preview keys appear unresponsive | Focus the OpenCV window. While it says **Preparing review**, wait for encoding and validation. |
+| Writer or storage error | Check write access and available space for the dataset and its staging directory. |
+| Registry error after saving a take | Keep the session active and reconcile the saved pair with `registry sync --dry-run`, then `registry sync`. |
 
 ## Automated tests
 
@@ -95,16 +185,17 @@ datasets/raw/
 python -m pytest -q
 ```
 
-The suite mocks the camera, writer, decoder, keyboard, window, and clock. It checks state transitions, frame timing, untouched frame delivery to the writer, metadata, rejection and acceptance, repetition progress, and cleanup on failures.
+The tests use temporary SQLite databases and mocked camera, video, window, and keyboard interfaces. They cover the original capture workflow, migrations and foreign keys, consent, sessions, registration, recovery, synchronization, and coverage.
 
-## Manual physical-camera checklist
+## Manual testing checklist
 
-Use a fresh label such as `CAMERA_TEST` for the checklist so that existing samples do not affect file counts.
+Use a fresh test database and raw dataset directory. Set `UGSL_REGISTRY_DB` and `UGSL_DATASET_ROOT` as shown above so each command uses the same test locations.
 
-1. [ ] Run `python cli.py preview --camera 0`. Confirm a live image and the expected dimensions. Adjust the signer’s position, press Q, then rerun preview to verify the camera was released.
-2. [ ] Run `python cli.py capture --sign CAMERA_TEST --signer SIGNER001 --duration 3 --repetitions 2`. Confirm the sign, signer, framing guide, and **Sample 1 of 2**.
-3. [ ] Press Space and check the countdown and recording progress. Press Esc during the countdown or take. Verify that the session returns to **Sample 1 of 2** and creates no video or sidecar.
-4. [ ] Press Space and complete a take using a clearly visible movement. Press P in Review, then R. Check that the replay returns to Review, rejection returns to Ready, and the sample stays at **1 of 2**.
-5. [ ] Record and accept two takes. Confirm the sample advances after the first accept and the session exits after the second. Check that there are two MP4/JSON pairs under `datasets/raw/CAMERA_TEST/SIGNER001/`.
-6. [ ] Play the MP4s in an external player. Check that the full frame and original orientation are preserved, that there are no overlays, and that motion and duration look close to the live take. Verify sidecar labels, UUIDs, repetition numbers, dimensions, and byte sizes. Compare `frame_count / encoded_fps` with `actual_duration_seconds`.
-7. [ ] Rerun the capture command with the same labels, start a take, then press Q during recording or review. Confirm the accepted count on disk is still two and that the camera can reopen. For a removable camera, also check that disconnecting it early during a longer take reports an error and leaves no new pair.
+1. [ ] Run local preview, focus the window, and verify that Q releases the device. Run a standalone capture. Confirm that files land outside raw and `sample list` is empty.
+2. [ ] Add a sign and a variant, and register a signer. Confirm that session creation fails with unknown consent. Record granted consent and create a local session.
+3. [ ] Request two registered repetitions. Cancel one take with Esc, replay and reject one with P and R, then accept two. Verify that the repetition advances only after acceptance and both sample statuses are `CAPTURED`.
+4. [ ] Play accepted MP4s in an external player. Check orientation, duration, full framing, and absence of overlays. Check that UUIDs, dimensions, sign and session IDs, and stored relative paths agree with the registry and sidecars.
+5. [ ] Capture another sign in the same session. Check `stats --by session` and `stats --coverage`. Rename that sign and confirm the sample remains associated with the same ID and file.
+6. [ ] Run sync dry-run and sync. Confirm that already registered samples are skipped. If you have a legacy pair, place it in the test raw directory with a valid path, map its sign and signer to an active session, and verify that dry-run proposes it while sync registers it once.
+7. [ ] Complete the local session and confirm it rejects new submissions. Open a remote session. Preview a remote stream, close preview, then record and accept a take with `--source`. Verify the remote session linkage and playback.
+8. [ ] Withdraw the test signer’s consent. Check the reported paths, confirm the files remain and the sample statuses are `EXCLUDED`, and verify that new sessions and contributions are blocked. Confirm that coverage drops while the total registered sample count stays the same.

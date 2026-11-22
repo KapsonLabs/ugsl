@@ -4,6 +4,7 @@ import json
 import math
 import os
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -15,7 +16,7 @@ import cv2
 
 from config import DATASET_ROOT, CaptureConfig, validate_identifier
 from ingestion.exceptions import CameraError, CaptureError, RecordingError
-from ingestion.schemas import RecordingMetadata, RecordingState as State
+from ingestion.schemas import RecordingContext, RecordingMetadata, RecordingState as State
 
 WINDOW = "UGSL Camera Capture"
 MAX_CONSECUTIVE_FAILURES = 5
@@ -32,19 +33,26 @@ class CameraCapture:
 
     def __enter__(self) -> "CameraCapture":
         try:
-            self._camera = cv2.VideoCapture(self.config.camera_index)
+            if self.config.source is None:
+                self._camera = cv2.VideoCapture(self.config.camera_index)
+            else:
+                self._camera = cv2.VideoCapture(
+                    self.config.source, cv2.CAP_FFMPEG,
+                    [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000],
+                )
             if not self._camera.isOpened():
-                raise CameraError(f"Cannot open camera {self.config.camera_index}. Check the device and camera permissions.")
-            self._camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
-            self._camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
-            self._camera.set(cv2.CAP_PROP_FPS, self.config.fps)
+                raise CameraError(f"Cannot open {self.source_label}. Check the device, stream or camera permissions.")
+            if self.config.source is None:
+                self._camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
+                self._camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
+                self._camera.set(cv2.CAP_PROP_FPS, self.config.fps)
             for _ in range(MAX_CONSECUTIVE_FAILURES):
                 if self.read() is not None:
                     return self
-            raise CameraError(f"Camera {self.config.camera_index} opened but delivered no frames.")
+            raise CameraError(f"{self.source_label.capitalize()} opened but delivered no frames.")
         except cv2.error as exc:
             self.close()
-            raise CameraError(f"Could not initialize camera {self.config.camera_index}: {exc}") from exc
+            raise CameraError(f"Could not initialize {self.source_label}.") from exc
         except BaseException:
             self.close()
             raise
@@ -57,14 +65,18 @@ class CameraCapture:
             camera, self._camera = self._camera, None
             camera.release()
 
+    @property
+    def source_label(self) -> str:
+        return "remote camera" if self.config.source is not None else f"camera {self.config.camera_index}"
+
     def read(self):
         """Return an untouched BGR frame, or None for a recoverable failed read."""
         try:
             if self._camera is None or not self._camera.isOpened():
-                raise CameraError(f"Camera {self.config.camera_index} is closed or disconnected.")
+                raise CameraError(f"{self.source_label.capitalize()} is closed or disconnected.")
             ok, frame = self._camera.read()
         except cv2.error as exc:
-            raise CameraError(f"Camera {self.config.camera_index} could not read a frame: {exc}") from exc
+            raise CameraError(f"{self.source_label.capitalize()} could not read a frame.") from exc
         if not ok or frame is None or not frame.size:
             return None
         if frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype.name != "uint8":
@@ -78,19 +90,22 @@ class CameraCapture:
         self._run()
 
     def capture(
-        self, sign: str, signer: str, dataset_root: Path = DATASET_ROOT
+        self, sign: str, signer: str, dataset_root: Path = DATASET_ROOT, *,
+        context: RecordingContext | None = None,
+        before_record: Callable[[], None] | None = None,
+        on_accept: Callable[[RecordingMetadata], None] | None = None,
     ) -> list[RecordingMetadata]:
         """Return the samples accepted in this session, in repetition order."""
         validate_identifier(sign, "Sign label")
         validate_identifier(signer, "Signer identifier")
-        return self._run(sign, signer, Path(dataset_root))
+        return self._run(sign, signer, Path(dataset_root), context, before_record, on_accept)
 
-    def _run(self, sign=None, signer=None, root=None):
+    def _run(self, sign=None, signer=None, root=None, context=None, before_record=None, on_accept=None):
         try:
             with self:
                 try:
                     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-                    session = _Session(self, sign, signer, root)
+                    session = _Session(self, sign, signer, root, context, before_record, on_accept)
                     if self.resolution != (self.config.width, self.config.height):
                         width, height = self.resolution
                         session.notice = f"Camera supplied {width} x {height}"
@@ -106,13 +121,19 @@ class CameraCapture:
 
 class _Session:
     def __init__(
-        self, camera: CameraCapture, sign: str | None, signer: str | None, root: Path | None
+        self, camera: CameraCapture, sign: str | None, signer: str | None, root: Path | None,
+        context: RecordingContext | None, before_record: Callable[[], None] | None,
+        on_accept: Callable[[RecordingMetadata], None] | None,
     ):
         self.camera = camera
         self.config = camera.config
         self.sign = sign
         self.signer = signer
         self.root = root
+        self.context = context
+        self.before_record = before_record
+        self.on_accept = on_accept
+        self.gloss = context.gloss if context else sign
         self.state = State.READY
         self.accepted: list[RecordingMetadata] = []
         self.pending: RecordingMetadata | None = None
@@ -149,7 +170,7 @@ class _Session:
         if frame is None:
             self.read_failures += 1
             if self.read_failures >= MAX_CONSECUTIVE_FAILURES:
-                raise CameraError(f"Camera {self.config.camera_index} stopped delivering frames. Check its connection.")
+                raise CameraError(f"{self.camera.source_label.capitalize()} stopped delivering frames. Check its connection.")
         else:
             self.read_failures = 0
             self.frame = frame
@@ -218,13 +239,15 @@ class _Session:
         )
 
     def _record(self):
+        if self.before_record is not None:
+            self.before_record()
         resolution = self.camera.resolution
         # Reuse a single contiguous buffer when reading raw frames back for encoding.
         buffer = self.frame.copy(order="C")
         pixels = memoryview(buffer).cast("B")
         frame_count = failed_reads = 0
         with TemporaryFile(dir=self.staging) as raw:
-            recorded_at = datetime.now(UTC).isoformat(timespec="milliseconds")
+            recorded_at = datetime.now(UTC).isoformat(timespec="microseconds")
             self.state = State.RECORDING
             start = time.monotonic()
             elapsed = 0.0
@@ -262,13 +285,14 @@ class _Session:
 
         encoded_fps, size = self._validate_video(resolution, frame_count)
         sample_id = str(uuid4())
-        path = self.root / self.sign / self.signer / f"{sample_id}.mp4"
+        relative_path = Path(self.sign) / self.signer / f"{sample_id}.mp4"
+        path = relative_path if self.context else self.root / relative_path
         self.pending = RecordingMetadata(
             sample_id=sample_id,
-            gloss=self.sign,
+            gloss=self.gloss,
             signer_id=self.signer,
             repetition=len(self.accepted) + 1,
-            camera_index=self.config.camera_index,
+            camera_index=self.config.camera_index if self.config.source is None else None,
             width=resolution[0],
             height=resolution[1],
             requested_fps=self.config.fps,
@@ -281,6 +305,8 @@ class _Session:
             file_size_bytes=size,
             file_path=str(path),
             recorded_at=recorded_at,
+            sign_id=self.context.sign_id if self.context else None,
+            session_id=self.context.session_id if self.context else None,
         )
         self.state = State.REVIEW
 
@@ -339,6 +365,8 @@ class _Session:
     def _accept(self):
         pending = self.pending
         video = Path(pending.file_path)
+        if self.context:
+            video = self.root / video
         sidecar = video.with_suffix(".json")
         staged_json = self.staging / "take.json"
 
@@ -366,10 +394,12 @@ class _Session:
                 raise RecordingError(f"Could not save the recording and metadata: {exc}") from exc
             raise
 
-        self.accepted.append(pending)
-        self.pending = None
         self._video.unlink()
         staged_json.unlink()
+        if self.on_accept is not None:
+            self.on_accept(pending)
+        self.accepted.append(pending)
+        self.pending = None
         self.notice = f"Sample {pending.repetition} saved."
         self.state = State.COMPLETED if len(self.accepted) == self.config.repetitions else State.READY
 
@@ -382,10 +412,10 @@ class _Session:
             cv2.rectangle(preview, (width // 4, height // 8), (width * 3 // 4, height * 7 // 8), (128, 165, 150), 1)
 
         if self.root is None:
-            lines = [f"Camera {self.config.camera_index}  |  {width} x {height}", "Q quit"]
+            lines = [f"{self.camera.source_label.capitalize()}  |  {width} x {height}", "Q quit"]
         else:
             lines = [
-                f"Sign: {self.sign}",
+                f"Sign: {self.gloss}",
                 f"Signer: {self.signer}",
                 f"Sample: {len(self.accepted) + 1} of {self.config.repetitions}",
                 f"Status: {self.state}",
