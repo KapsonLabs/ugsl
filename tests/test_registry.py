@@ -12,11 +12,14 @@ import pytest
 from typer.testing import CliRunner
 
 from cli import app
+from ingestion import pipeline
 from ingestion.capture import CameraCapture, State
-from registry import database, samples, sessions, signers, statistics, vocabulary
-from registry.database import Database, RegistryError
+from ingestion.schemas import ValidationReport, ValidationStatus, VideoMetadata
+from ingestion.validator import VideoValidator
+from registry import database, media_maintenance, samples, sessions, signers, statistics, vocabulary
+from registry.database import Database, DatabaseError, RegistryError
 from services.recording_service import capture_registered
-from tests.test_capture import Rig, SETTINGS
+from tests.test_capture import FakeWriter, Rig, SETTINGS
 
 
 @pytest.fixture
@@ -42,7 +45,7 @@ def pair(root, *, sample_id=None, directory=("WATER", "SIGNER001"), **changes):
     sample_id = sample_id or str(uuid4())
     path = root.joinpath(*directory, f"{sample_id}.mp4")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"mock mp4")
+    path.write_bytes(UUID(sample_id).bytes[:8])
     metadata = {
         "sample_id": sample_id, "gloss": "WATER", "signer_id": "SIGNER001",
         "repetition": 1, "camera_index": 0, "width": 1280, "height": 720,
@@ -62,7 +65,7 @@ def test_lazy_database_initialization_and_foreign_keys(db):
     assert not db.path.exists()
     with db.connect(write=True) as connection:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
             connection.execute(
                 """INSERT INTO recording_sessions
@@ -81,18 +84,18 @@ def test_migrations_are_atomic_idempotent_and_preserve_existing_rows(db, tmp_pat
     migrations = tmp_path / "migrations"
     shutil.copytree(database.MIGRATIONS, migrations)
     monkeypatch.setattr(database, "MIGRATIONS", migrations)
-    script = migrations / "002_test.sql"
+    script = migrations / "003_test.sql"
     script.write_text("CREATE TABLE migration_test (name TEXT); INVALID SQL;")
     with pytest.raises(RegistryError, match="migration failed"):
         vocabulary.show(db, sign.id)
     with sqlite3.connect(db.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert connection.execute("SELECT name FROM sqlite_master WHERE name = 'migration_test'").fetchone() is None
     script.write_text("CREATE TABLE migration_test (name TEXT);")
     for _ in range(2):
         assert vocabulary.show(Database(db.path), sign.id) == sign
         with db.connect() as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
 
 
 def test_write_transaction_rolls_back_and_database_error_is_sanitized(db, tmp_path):
@@ -182,7 +185,11 @@ def test_register_legacy_pair_preserves_metadata_and_path(db, root, catalog):
     with db.connect(write=True) as connection:
         with pytest.raises(sqlite3.IntegrityError, match="video_samples.file_path"):
             connection.execute(
-                """INSERT INTO video_samples SELECT ?, sign_id, session_id, sample_type, repetition,
+                """INSERT INTO video_samples (id, sign_id, session_id, sample_type, repetition,
+                       file_path, metadata_path, width, height, requested_fps, measured_fps, encoded_fps,
+                       frame_count, failed_frame_reads, requested_duration_seconds, actual_duration_seconds,
+                       file_size_bytes, status, recorded_at, registered_at)
+                       SELECT ?, sign_id, session_id, sample_type, repetition,
                    file_path, metadata_path, width, height, requested_fps, measured_fps, encoded_fps,
                    frame_count, failed_frame_reads, requested_duration_seconds, actual_duration_seconds,
                    file_size_bytes, status, recorded_at, registered_at FROM video_samples WHERE id = ?""",
@@ -341,7 +348,27 @@ def test_statistics_totals_groups_and_consent_aware_coverage(db, root, catalog):
     assert water["registered"] == 2 and water["collected"] == water["unique_signers"] == 0
 
 
-def test_camera_acceptance_registers_each_take_and_keeps_one_session_for_multiple_signs(db, root, catalog, monkeypatch):
+@pytest.fixture
+def mock_camera_media(monkeypatch):
+    release = FakeWriter.release
+
+    def finish(writer):
+        release(writer)
+        if writer.path.is_file():
+            writer.path.write_bytes(uuid4().bytes)
+
+    def validate(_, path):
+        video = VideoMetadata(
+            "mov,mp4", ".mp4", "mpeg4", "yuv420p", 160, 120, None, "LANDSCAPE", 8.0, 8.0,
+            4, 0.5, 0.5, None, path.stat().st_size, False, None,
+        )
+        return video, ValidationReport(ValidationStatus.PASSED, [], [], [], {})
+
+    monkeypatch.setattr(FakeWriter, "release", finish)
+    monkeypatch.setattr(VideoValidator, "validate", validate)
+
+
+def test_camera_acceptance_registers_each_take_and_keeps_one_session_for_multiple_signs(db, root, catalog, monkeypatch, mock_camera_media):
     sign, _, session = catalog
     second = vocabulary.add(db, gloss="GOOD MORNING")
     for selection in (sign, second):
@@ -359,68 +386,69 @@ def test_camera_acceptance_registers_each_take_and_keeps_one_session_for_multipl
     assert len(list(root.rglob("*.mp4"))) == 2
 
 
-def test_registration_failure_preserves_files_for_idempotent_reconciliation(db, root, catalog, monkeypatch):
+def test_registration_failure_preserves_files_for_idempotent_reconciliation(db, root, catalog, monkeypatch, mock_camera_media):
     sign, _, session = catalog
-    register = samples.register
+    save = pipeline.save_validation
     calls = []
 
-    def fail_second(*args, **kwargs):
-        calls.append(args[2])
-        assert args[2].is_file() and args[2].with_suffix(".mp4").is_file()
+    def fail_second(connection, sample_id, *args):
+        calls.append(sample_id)
         if len(calls) == 2:
-            raise RegistryError("Simulated database failure")
-        return register(*args, **kwargs)
+            assert list(root.rglob(f"{sample_id}.mp4")) and list(root.rglob(f"{sample_id}.json"))
+            raise DatabaseError("Simulated database failure")
+        return save(connection, sample_id, *args)
 
     with monkeypatch.context() as patcher:
         rig = Rig(patcher)
-        patcher.setattr(samples, "register", fail_second)
+        patcher.setattr(pipeline, "save_validation", fail_second)
         rig.keys[State.READY].extend([" ", " "])
         rig.keys[State.REVIEW].extend(["a", "a"])
-        with pytest.raises(RegistryError, match="was saved but registration failed"):
+        with pytest.raises(RegistryError, match="Run registry reconcile"):
             capture_registered(db, CameraCapture(replace(SETTINGS, repetitions=2)), root,
                                sign_id=sign.id, session_id=session.id)
         rig.assert_clean(root)
     assert len(samples.list_samples(db)) == 1
     assert len(list(root.rglob("*.mp4"))) == 2
     vocabulary.update(db, sign.id, gloss="RENAMED WATER")
-    recovered = samples.synchronize(db, root)
-    assert recovered.skipped == 1 and len(recovered.registered) == 1 and not recovered.issues
+    service = pipeline.IngestionService(db, root)
+    recovered = media_maintenance.reconcile(service)
+    assert len(recovered.actions) == 1 and not recovered.issues
     assert sorted(row.repetition for row in samples.list_samples(db)) == [1, 2]
     assert samples.synchronize(db, root).skipped == 2
 
 
-def test_consent_is_rechecked_after_camera_acceptance(db, root, catalog, monkeypatch):
+def test_consent_is_rechecked_after_camera_acceptance(db, root, catalog, monkeypatch, mock_camera_media):
     sign, signer, session = catalog
-    register = samples.register
+    validate = VideoValidator.validate
 
     def withdraw_before_register(*args, **kwargs):
         signers.consent(db, signer.code, "WITHDRAWN")
-        return register(*args, **kwargs)
+        return validate(*args, **kwargs)
 
     rig = Rig(monkeypatch)
     rig.keys[State.READY].append(" ")
     rig.keys[State.REVIEW].append("a")
-    monkeypatch.setattr(samples, "register", withdraw_before_register)
+    monkeypatch.setattr(VideoValidator, "validate", withdraw_before_register)
     with pytest.raises(RegistryError, match="WITHDRAWN"):
         capture_registered(db, CameraCapture(SETTINGS), root, sign_id=sign.id, session_id=session.id)
     assert not samples.list_samples(db)
-    assert len(list(root.rglob("*.mp4"))) == 1
+    assert not list(root.rglob("*.mp4"))
     rig.assert_clean(root)
 
 
-def test_withdrawal_between_repetitions_blocks_the_next_take(db, root, catalog, monkeypatch):
+def test_withdrawal_between_repetitions_blocks_the_next_take(db, root, catalog, monkeypatch, mock_camera_media):
     sign, signer, session = catalog
-    register = samples.register
+    ingest = pipeline.IngestionService.ingest_camera
 
     def withdraw_after_register(*args, **kwargs):
-        result = register(*args, **kwargs)
+        result = ingest(*args, **kwargs)
         signers.consent(db, signer.code, "WITHDRAWN")
         return result
 
     rig = Rig(monkeypatch)
     rig.keys[State.READY].extend([" ", " "])
     rig.keys[State.REVIEW].append("a")
-    monkeypatch.setattr(samples, "register", withdraw_after_register)
+    monkeypatch.setattr(pipeline.IngestionService, "ingest_camera", withdraw_after_register)
     with pytest.raises(RegistryError, match="WITHDRAWN"):
         capture_registered(db, CameraCapture(replace(SETTINGS, repetitions=2)), root,
                            sign_id=sign.id, session_id=session.id)
@@ -429,7 +457,7 @@ def test_withdrawal_between_repetitions_blocks_the_next_take(db, root, catalog, 
     rig.assert_clean(root)
 
 
-def test_remote_camera_uses_same_review_and_registration(db, root, catalog, monkeypatch):
+def test_remote_camera_uses_same_review_and_registration(db, root, catalog, monkeypatch, mock_camera_media):
     sign, signer, _ = catalog
     session = sessions.create(db, signer_code=signer.code, camera_source_type="REMOTE")
     rig = Rig(monkeypatch)
@@ -455,7 +483,7 @@ def test_remote_camera_uses_same_review_and_registration(db, root, catalog, monk
     rig.assert_clean(root)
 
 
-def test_cli_routes_registry_and_standalone_capture(db, root, monkeypatch):
+def test_cli_routes_registry_and_standalone_capture(db, root, monkeypatch, mock_camera_media):
     runner = CliRunner()
     base = ["--db", str(db.path), "--dataset-root", str(root)]
 
@@ -490,3 +518,17 @@ def test_cli_routes_registry_and_standalone_capture(db, root, monkeypatch):
     assert len(list((root.parent / "standalone").rglob("*.mp4"))) == 1
     assert len(samples.list_samples(db)) == 1
     assert "1 registered samples excluded" in cli("signer", "withdraw", "SIGNER001")
+
+
+@pytest.mark.parametrize("session_id, message", [
+    ("SESSION_ID", "Replace SESSION_ID with a session UUID"),
+    ("00000000-0000-4000-8000-000000000000", "Unknown recording session"),
+])
+def test_capture_explains_how_to_find_the_session_id(db, root, session_id, message):
+    result = CliRunner().invoke(app, [
+        "--db", str(db.path), "--dataset-root", str(root),
+        "capture", "--sign", "UGSL0001", "--session", session_id,
+    ])
+    assert result.exit_code == 1
+    assert message in result.output
+    assert "python cli.py session list" in result.output

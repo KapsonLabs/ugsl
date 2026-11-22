@@ -2,14 +2,17 @@
 
 from pathlib import Path
 
+from config import QualityConfig
 from ingestion.capture import CameraCapture
-from ingestion.schemas import RecordingContext, RecordingMetadata
-from registry import samples, sessions, vocabulary
+from ingestion.pipeline import IngestionService
+from ingestion.schemas import IngestionOutcome, RecordingContext, RecordingMetadata
+from registry import sessions, vocabulary
 from registry.database import Database, RegistryError
 
 
 def capture_registered(
     db: Database, camera: CameraCapture, dataset_root: Path, *, sign_id: str, session_id: str,
+    quality: QualityConfig | None = None,
 ) -> list[RecordingMetadata]:
     def validate_selection():
         with db.connect() as connection:
@@ -27,20 +30,21 @@ def capture_registered(
         raise RegistryError("This session requires a local camera (--camera).")
     root = dataset_root.resolve()
     context = RecordingContext(sign_id=sign.id, session_id=session.id, gloss=sign.gloss)
+    ingestion = IngestionService(db, root, quality)
 
     def before_record() -> None:
         validate_selection()
 
-    def register_accepted(recording: RecordingMetadata) -> None:
-        try:
-            pair = (root / recording.file_path).with_suffix(".json")
-            samples.register(db, root, pair, sign_id=sign.id, session_id=session.id)
-        except RegistryError as exc:
-            raise RegistryError(
-                f"Sample {recording.sample_id} was saved but registration failed: {exc} "
-                "Resolve the reported issue and run registry sync."
-            ) from exc
+    def register_accepted(path: Path, recording: RecordingMetadata) -> str | None:
+        result = ingestion.ingest_camera(path, recording, sign_id=sign.id, session_id=session.id)
+        if result.outcome == IngestionOutcome.ERROR or result.error_code == "INVALID_ASSOCIATION":
+            raise RegistryError(f"Sample {recording.sample_id}: {result.message}")
+        if result.outcome not in {IngestionOutcome.INGESTED, IngestionOutcome.INGESTED_WITH_WARNINGS}:
+            if result.sample_id:
+                return f"{result.message} Existing sample {result.sample_id}."
+            return result.message
+        return None
 
     return camera.capture(
-        sign.id, signer.code, root, context=context, before_record=before_record, on_accept=register_accepted,
+        sign.id, signer.code, root, context=context, before_record=before_record, ingest_accepted=register_accepted,
     )

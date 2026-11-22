@@ -8,7 +8,10 @@ from pathlib import Path
 from uuid import UUID
 
 from config import DATASET_ROOT
-from ingestion.schemas import RecordingMetadata
+from ingestion.exceptions import MediaError
+from ingestion.hashing import sha256_file
+from ingestion.schemas import RecordingMetadata, ValidationStatus
+from ingestion.storage import safe_path
 from registry import sessions, signers, vocabulary
 from registry.database import Database, RegistryError
 from registry.models import RecordingSession, VideoSample
@@ -65,6 +68,8 @@ def _load(dataset_root: Path, sidecar: Path):
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError
+        if "validation" in payload or "sha256" in payload:
+            raise RegistryError("This is an ingestion sidecar. Use registry reconcile for incomplete registrations.")
         known_fields = {field.name for field in fields(RecordingMetadata)}
         meta = RecordingMetadata(**{key: value for key, value in payload.items() if key in known_fields})
         if _uuid(meta.sample_id, "Sample ID") != path.stem:
@@ -144,6 +149,23 @@ def _resolve(connection, meta, sign_id, session_id):
     return sign, session, signer
 
 
+def lookup_hash(connection, root: Path, digest: str, size: int):
+    query = """SELECT v.id, v.sign_id, v.file_path, r.signer_id FROM video_samples v
+               JOIN recording_sessions r ON r.id = v.session_id WHERE """
+    existing = connection.execute(query + "v.sha256 = ?", (digest,)).fetchone()
+    if existing is not None:
+        return existing
+    # Cover older records before backfill by checking plausible matches.
+    for row in connection.execute(query + "v.sha256 IS NULL AND v.file_size_bytes = ? ORDER BY v.id", (size,)):
+        try:
+            path = safe_path(root, row["file_path"])
+            if path.is_file() and sha256_file(path) == digest:
+                return row
+        except (OSError, MediaError):
+            continue
+    return None
+
+
 def register(
     db: Database, dataset_root: Path, sidecar: Path, *, sign_id: str | None = None,
     session_id: str | None = None, dry_run: bool = False,
@@ -152,6 +174,11 @@ def register(
     if dry_run and not db.read_only:
         db = Database(db.path, read_only=True)
     meta, file_path, metadata_path, recorded_at = _load(Path(dataset_root), Path(sidecar))
+    root = Path(dataset_root).resolve()
+    try:
+        digest = sha256_file(root / file_path)
+    except OSError as exc:
+        raise RegistryError("Could not hash the recording.") from exc
     metrics = {name: getattr(meta, name) for name in (*INTEGER_FIELDS, *REAL_FIELDS)}
     with db.connect(write=not dry_run) as connection:
         existing = [record(VideoSample, row) for row in connection.execute(
@@ -165,6 +192,7 @@ def register(
                 or any(getattr(sample, name) != value for name, value in metrics.items())
                 or (meta.sign_id and meta.sign_id.strip().upper() != sample.sign_id)
                 or (meta.session_id and meta.session_id != sample.session_id)
+                or (sample.sha256 is not None and sample.sha256 != digest)
             ):
                 raise RegistryError("The sample UUID or video path conflicts with a registered recording.")
             session = sessions.find(connection, sample.session_id)
@@ -174,21 +202,27 @@ def register(
 
         sign, session, signer = _resolve(connection, meta, sign_id, session_id)
         signers.require_recording_consent(connection, signer, recorded_at)
+        duplicate = lookup_hash(connection, root, digest, meta.file_size_bytes)
+        if duplicate is not None:
+            if duplicate["sign_id"] != sign.id or duplicate["signer_id"] != signer.id:
+                raise RegistryError(f"Identical content is registered for a different sign or signer ({duplicate['id']}).")
+            previous = connection.execute("SELECT * FROM video_samples WHERE id = ?", (duplicate["id"],)).fetchone()
+            return Registration(record(VideoSample, previous), created=False)
         sample = VideoSample(
             id=meta.sample_id, sign_id=sign.id, session_id=session.id, sample_type="ISOLATED",
             file_path=file_path, metadata_path=metadata_path, status="CAPTURED",
-            recorded_at=recorded_at, registered_at=utc_now(), **metrics,
+            recorded_at=recorded_at, registered_at=utc_now(), sha256=digest, **metrics,
         )
         if not dry_run:
             connection.execute(
                 """INSERT INTO video_samples (id, sign_id, session_id, sample_type, repetition, file_path,
                    metadata_path, width, height, requested_fps, measured_fps, encoded_fps, frame_count,
                    failed_frame_reads, requested_duration_seconds, actual_duration_seconds, file_size_bytes,
-                   status, recorded_at, registered_at)
+                   status, recorded_at, registered_at, sha256)
                    VALUES (:id, :sign_id, :session_id, :sample_type, :repetition, :file_path, :metadata_path,
                      :width, :height, :requested_fps, :measured_fps, :encoded_fps, :frame_count,
                      :failed_frame_reads, :requested_duration_seconds, :actual_duration_seconds,
-                     :file_size_bytes, :status, :recorded_at, :registered_at)""",
+                     :file_size_bytes, :status, :recorded_at, :registered_at, :sha256)""",
                 vars(sample),
             )
         return Registration(sample, created=True)
@@ -202,17 +236,35 @@ def synchronize(db: Database, dataset_root: Path, *, sign_id=None, session_id=No
             vocabulary.find(connection, sign_id)
         if session_id is not None:
             sessions.find(connection, session_id)
+        ingested_paths = {row[0] for row in connection.execute(
+            "SELECT metadata_path FROM video_samples WHERE technical_validation_status <> 'PENDING' OR source_type = 'IMPORT'"
+        )}
     root = Path(dataset_root).resolve()
     report = SyncReport(registered=[], skipped=0, issues=[])
-    proposed = set()
+    proposed_ids, proposed_hashes = set(), {}
     for sidecar in sorted(root.rglob("*.json")):
         relative = sidecar.relative_to(root).as_posix()
+        if relative in ingested_paths:
+            report.skipped += 1
+            continue
         try:
             result = register(db, root, sidecar, sign_id=sign_id, session_id=session_id, dry_run=dry_run)
             if result.created:
-                if result.sample.id in proposed:
+                if result.sample.id in proposed_ids:
                     raise RegistryError("The sample UUID conflicts with an earlier recording in this scan.")
-                proposed.add(result.sample.id)
+                previous = proposed_hashes.get(result.sample.sha256)
+                if previous is not None:
+                    if previous.sign_id != result.sample.sign_id:
+                        raise RegistryError("Identical content conflicts with an earlier recording in this scan.")
+                    with db.connect() as connection:
+                        first = sessions.find(connection, previous.session_id)
+                        second = sessions.find(connection, result.sample.session_id)
+                    if first.signer_id != second.signer_id:
+                        raise RegistryError("Identical content conflicts with an earlier recording in this scan.")
+                    report.skipped += 1
+                    continue
+                proposed_ids.add(result.sample.id)
+                proposed_hashes[result.sample.sha256] = result.sample
                 report.registered.append(relative)
             else:
                 report.skipped += 1
@@ -227,14 +279,17 @@ def show(db: Database, sample_id: str) -> VideoSample:
                    (_uuid(sample_id.strip().lower(), "Sample ID"),), "Unknown video sample.")
 
 
-def list_samples(db: Database, *, sign_id=None, session_id=None, status=None) -> list[VideoSample]:
+def list_samples(db: Database, *, sign_id=None, session_id=None, status=None, validation_status=None) -> list[VideoSample]:
     if status is not None:
         status = choice(status, "Sample status", STATUSES)
+    if validation_status is not None:
+        validation_status = choice(validation_status, "Technical validation status", tuple(ValidationStatus))
     with db.connect() as connection:
         sign_id = vocabulary.find(connection, sign_id).id if sign_id is not None else None
         session_id = sessions.find(connection, session_id).id if session_id is not None else None
         return [record(VideoSample, row) for row in connection.execute(
             """SELECT * FROM video_samples WHERE (? IS NULL OR sign_id = ?) AND
-               (? IS NULL OR session_id = ?) AND (? IS NULL OR status = ?) ORDER BY recorded_at, id""",
-            (sign_id, sign_id, session_id, session_id, status, status),
+               (? IS NULL OR session_id = ?) AND (? IS NULL OR status = ?)
+               AND (? IS NULL OR technical_validation_status = ?) ORDER BY recorded_at, id""",
+            (sign_id, sign_id, session_id, session_id, status, status, validation_status, validation_status),
         )]

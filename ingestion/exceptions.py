@@ -11,3 +11,12 @@ class CameraError(CaptureError):
 
 class RecordingError(CaptureError):
     """A recording could not be encoded, validated, or saved."""
+
+
+class MediaError(Exception):
+    """A media failure with an operator-safe message and stable error code."""
+
+    def __init__(self, code: str, message: str, *, operational: bool = False):
+        super().__init__(message)
+        self.code = code
+        self.operational = operational

@@ -37,7 +37,7 @@ def require_eligible(signer: Signer) -> None:
         raise RegistryError(f"Training recordings require granted consent. Current status is {signer.consent_status}.")
 
 
-def require_recording_consent(connection, signer: Signer, recorded_at: str) -> None:
+def require_recording_consent(connection, signer: Signer, recorded_at: str | None) -> None:
     """Keep pre-withdrawal and withdrawal-period footage out after a fresh grant."""
     grant = connection.execute(
         """SELECT recorded_at FROM signer_consent_events
@@ -46,6 +46,8 @@ def require_recording_consent(connection, signer: Signer, recorded_at: str) -> N
            ) ORDER BY id LIMIT 1""",
         (signer.id, signer.id),
     ).fetchone()
+    if grant and recorded_at is None:
+        raise RegistryError("A verified recording timestamp is required after a fresh consent grant.")
     if grant and datetime.fromisoformat(recorded_at) <= datetime.fromisoformat(grant["recorded_at"]):
         raise RegistryError("This recording predates the fresh consent granted after withdrawal.")
 

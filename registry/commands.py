@@ -7,6 +7,7 @@ from typing import Annotated
 
 import typer
 
+from ingestion.exceptions import MediaError
 from registry import samples, sessions, signers, statistics, vocabulary
 from registry.database import Database, RegistryError
 
@@ -32,7 +33,7 @@ def report_errors(function):
     def command(*args, **kwargs):
         try:
             return function(*args, **kwargs)
-        except RegistryError as exc:
+        except (RegistryError, MediaError) as exc:
             typer.echo(str(exc), err=True)
             raise typer.Exit(1) from exc
 
@@ -247,9 +248,12 @@ def sample_list(
     sign: Annotated[str | None, typer.Option()] = None,
     session: Annotated[str | None, typer.Option()] = None,
     status: Annotated[str | None, typer.Option()] = None,
+    validation_status: Annotated[str | None, typer.Option(help="Filter by latest technical validation status.")] = None,
 ):
-    rows = samples.list_samples(database(ctx), sign_id=sign, session_id=session, status=status)
-    _table([asdict(row) for row in rows], ("id", "sign_id", "session_id", "status", "file_path"))
+    rows = samples.list_samples(database(ctx), sign_id=sign, session_id=session, status=status,
+                                validation_status=validation_status)
+    _table([asdict(row) for row in rows],
+           ("id", "sign_id", "session_id", "status", "technical_validation_status", "file_path"))
 
 
 @sample_app.command("show")

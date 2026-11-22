@@ -44,3 +44,74 @@ class RecordingMetadata:
     recorded_at: str
     sign_id: str | None = None
     session_id: str | None = None
+
+
+class ValidationStatus(StrEnum):
+    PENDING = "PENDING"
+    PASSED = "PASSED"
+    PASSED_WITH_WARNINGS = "PASSED_WITH_WARNINGS"
+    FAILED = "FAILED"
+    ERROR = "ERROR"
+
+
+class IngestionOutcome(StrEnum):
+    INGESTED = "INGESTED"
+    INGESTED_WITH_WARNINGS = "INGESTED_WITH_WARNINGS"
+    DUPLICATE = "DUPLICATE"
+    CONFLICT = "CONFLICT"
+    REJECTED = "REJECTED"
+    ERROR = "ERROR"
+
+
+@dataclass(frozen=True)
+class VideoMetadata:
+    container_format: str
+    extension: str
+    video_codec: str | None
+    pixel_format: str | None
+    width: int | None
+    height: int | None
+    rotation: float | None
+    display_orientation: str | None
+    average_fps: float | None
+    nominal_fps: float | None
+    frame_count: int | None
+    duration_seconds: float | None
+    stream_duration_seconds: float | None
+    bitrate: int | None
+    file_size_bytes: int
+    has_audio: bool
+    creation_time: str | None
+
+
+@dataclass(frozen=True)
+class ValidationCheck:
+    name: str
+    status: str
+    actual: object = None
+    minimum: float | None = None
+    maximum: float | None = None
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    validation_status: ValidationStatus
+    checks: list[ValidationCheck]
+    errors: list[str]
+    warnings: list[str]
+    metrics: dict
+    validation_profile: str = "ISOLATED"
+    validator_version: str = "1.0"
+
+
+@dataclass(frozen=True)
+class IngestionResult:
+    attempt_id: str
+    outcome: IngestionOutcome
+    report: ValidationReport
+    sample_id: str | None = None
+    sha256: str | None = None
+    error_code: str | None = None
+    message: str | None = None
+    storage_bytes: int = 0
+    dry_run: bool = False

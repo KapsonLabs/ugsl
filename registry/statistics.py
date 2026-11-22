@@ -56,7 +56,7 @@ def summary(db: Database) -> Summary:
                       (SELECT count(*) FROM signs WHERE is_active) AS active_signs,
                       (SELECT count(*) FROM signers) AS total_signers,
                       (SELECT count(*) FROM recording_sessions) AS total_sessions,
-                      count(*) AS total_samples, coalesce(sum(actual_duration_seconds), 0.0) AS footage_seconds,
+                      count(*) AS total_samples, coalesce(sum(coalesce(duration_seconds, actual_duration_seconds)), 0.0) AS footage_seconds,
                       coalesce(sum(file_size_bytes), 0) AS storage_bytes FROM video_samples""",
         ).fetchone()
     return Summary(**dict(row))

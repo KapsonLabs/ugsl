@@ -1,10 +1,11 @@
 """Defaults and validation shared by the camera and command line."""
 
 import math
+import os
 import re
-from urllib.parse import urlsplit
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DATASET_ROOT = Path("datasets/raw")
 REGISTRY_PATH = Path("datasets/registry.db")
@@ -68,3 +69,49 @@ class CaptureConfig:
                 or url.username is not None or url.password is not None
             ):
                 raise ValueError("Provide an HTTP(S) or RTSP(S) camera URL without embedded credentials.")
+
+
+@dataclass(frozen=True)
+class QualityConfig:
+    """Technical requirements and visual sampling for isolated signs."""
+
+    min_width: int = 640
+    min_height: int = 480
+    min_fps: float = 20
+    min_frame_count: int = 20
+    min_duration_seconds: float = 1
+    max_duration_seconds: float = 10
+    max_file_size_mb: float = 100
+    visual_samples: int = 8
+    probe_timeout: float = 20
+    decode_timeout: float = 60
+    quarantine_retention_days: int = 7
+
+    @classmethod
+    def from_environment(cls) -> "QualityConfig":
+        settings = {}
+        for field in fields(cls):
+            name = f"UGSL_QUALITY_{field.name.upper()}"
+            if (value := os.environ.get(name)) is not None:
+                try:
+                    settings[field.name] = field.type(value)
+                except ValueError as exc:
+                    raise ValueError(f"{name} must be a valid number.") from exc
+        return cls(**settings)
+
+    def __post_init__(self) -> None:
+        for name in ("min_width", "min_height", "min_frame_count", "visual_samples", "quarantine_retention_days"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer.")
+        for name in ("min_fps", "min_duration_seconds", "max_duration_seconds",
+                     "max_file_size_mb", "probe_timeout", "decode_timeout"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a finite positive number.")
+        if self.max_duration_seconds < self.min_duration_seconds:
+            raise ValueError("Maximum duration must be at least the minimum duration.")
+
+    @property
+    def max_file_size_bytes(self) -> int:
+        return int(self.max_file_size_mb * 1024**2)

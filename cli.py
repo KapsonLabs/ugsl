@@ -7,8 +7,9 @@ from typing import Annotated
 import typer
 
 from config import DATASET_ROOT, REGISTRY_PATH, CaptureConfig, validate_identifier
+from ingestion import commands as media_commands
 from ingestion.capture import CameraCapture
-from ingestion.exceptions import CaptureError
+from ingestion.exceptions import CaptureError, MediaError
 from registry import commands
 from registry.database import RegistryError
 from services.recording_service import capture_registered
@@ -16,6 +17,7 @@ from services.recording_service import capture_registered
 app = typer.Typer(help="Capture and manage the UGSL training dataset.", no_args_is_help=True)
 DEFAULTS = CaptureConfig()
 commands.mount(app)
+media_commands.mount(app)
 
 
 @app.callback()
@@ -80,13 +82,14 @@ def capture(
     try:
         device = CameraCapture(config)
         if session is not None:
-            accepted = capture_registered(commands.database(ctx), device, root, sign_id=sign, session_id=session)
+            accepted = capture_registered(commands.database(ctx), device, root, sign_id=sign, session_id=session,
+                                          quality=media_commands.configured_quality())
         else:
             standalone = root.resolve().parent / "standalone"
             if standalone.resolve().is_relative_to(root.resolve()):
                 raise RegistryError("Standalone captures require a directory outside the raw training dataset.")
             accepted = device.capture(sign, signer, standalone)
-    except (CaptureError, RegistryError) as exc:
+    except (CaptureError, RegistryError, MediaError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
     label = "Accepted and registered" if session is not None else "Accepted standalone test"

@@ -14,8 +14,11 @@ BACKGROUNDS = ("PLAIN", "COMPLEX", "OTHER")
 
 
 def find(connection, session_id: str) -> RecordingSession:
+    session_id = session_id.strip().lower()
+    if session_id == "session_id":
+        raise RegistryError("Replace SESSION_ID with a session UUID from `python cli.py session list`.")
     return get(connection, RecordingSession, "SELECT * FROM recording_sessions WHERE id = ?",
-               (session_id.strip().lower(),), "Unknown recording session.")
+               (session_id,), "Unknown recording session. Run `python cli.py session list` using the same database.")
 
 
 def require_open(session: RecordingSession) -> None:

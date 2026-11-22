@@ -54,19 +54,34 @@ class VideoSample:
     sign_id: str
     session_id: str
     sample_type: str
-    repetition: int
+    repetition: int | None
     file_path: str
     metadata_path: str
     width: int
     height: int
-    requested_fps: float
-    measured_fps: float
-    encoded_fps: float
+    requested_fps: float | None
+    measured_fps: float | None
+    encoded_fps: float | None
     frame_count: int
-    failed_frame_reads: int
-    requested_duration_seconds: float
-    actual_duration_seconds: float
+    failed_frame_reads: int | None
+    requested_duration_seconds: float | None
+    actual_duration_seconds: float | None
     file_size_bytes: int
     status: str
-    recorded_at: str
+    recorded_at: str | None
     registered_at: str
+    sha256: str | None = None
+    source_type: str = "CAMERA"
+    source_reference: str | None = None
+    notes: str | None = None
+    container_format: str | None = None
+    video_codec: str | None = None
+    pixel_format: str | None = None
+    average_fps: float | None = None
+    nominal_fps: float | None = None
+    duration_seconds: float | None = None
+    rotation: float | None = None
+    bitrate: int | None = None
+    technical_validation_status: str = "PENDING"
+    technical_validated_at: str | None = None
+    validator_version: str | None = None

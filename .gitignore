@@ -7,3 +7,7 @@ datasets/raw/*
 !datasets/raw/.gitkeep
 datasets/registry.db*
 datasets/standalone/
+datasets/staging/*
+!datasets/staging/.gitkeep
+datasets/quarantine/*
+!datasets/quarantine/.gitkeep

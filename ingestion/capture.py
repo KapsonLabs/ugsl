@@ -94,18 +94,20 @@ class CameraCapture:
         context: RecordingContext | None = None,
         before_record: Callable[[], None] | None = None,
         on_accept: Callable[[RecordingMetadata], None] | None = None,
+        ingest_accepted: Callable[[Path, RecordingMetadata], str | None] | None = None,
     ) -> list[RecordingMetadata]:
         """Return the samples accepted in this session, in repetition order."""
         validate_identifier(sign, "Sign label")
         validate_identifier(signer, "Signer identifier")
-        return self._run(sign, signer, Path(dataset_root), context, before_record, on_accept)
+        return self._run(sign, signer, Path(dataset_root), context, before_record, on_accept, ingest_accepted)
 
-    def _run(self, sign=None, signer=None, root=None, context=None, before_record=None, on_accept=None):
+    def _run(self, sign=None, signer=None, root=None, context=None, before_record=None, on_accept=None,
+             ingest_accepted=None):
         try:
             with self:
                 try:
                     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-                    session = _Session(self, sign, signer, root, context, before_record, on_accept)
+                    session = _Session(self, sign, signer, root, context, before_record, on_accept, ingest_accepted)
                     if self.resolution != (self.config.width, self.config.height):
                         width, height = self.resolution
                         session.notice = f"Camera supplied {width} x {height}"
@@ -124,6 +126,7 @@ class _Session:
         self, camera: CameraCapture, sign: str | None, signer: str | None, root: Path | None,
         context: RecordingContext | None, before_record: Callable[[], None] | None,
         on_accept: Callable[[RecordingMetadata], None] | None,
+        ingest_accepted: Callable[[Path, RecordingMetadata], str | None] | None,
     ):
         self.camera = camera
         self.config = camera.config
@@ -133,6 +136,7 @@ class _Session:
         self.context = context
         self.before_record = before_record
         self.on_accept = on_accept
+        self.ingest_accepted = ingest_accepted
         self.gloss = context.gloss if context else sign
         self.state = State.READY
         self.accepted: list[RecordingMetadata] = []
@@ -364,6 +368,25 @@ class _Session:
 
     def _accept(self):
         pending = self.pending
+        if self.ingest_accepted is None:
+            self._publish_take(pending)
+        else:
+            # The ingestion service owns publication and returns a notice when the take should be repeated.
+            self._show(self.frame, controls="Validating accepted take...")
+            notice = self.ingest_accepted(self._video, pending)
+            if notice:
+                self._discard(notice)
+                return
+
+        self._video.unlink()
+        if self.on_accept is not None:
+            self.on_accept(pending)
+        self.accepted.append(pending)
+        self.pending = None
+        self.notice = f"Sample {pending.repetition} saved."
+        self.state = State.COMPLETED if len(self.accepted) == self.config.repetitions else State.READY
+
+    def _publish_take(self, pending):
         video = Path(pending.file_path)
         if self.context:
             video = self.root / video
@@ -394,14 +417,7 @@ class _Session:
                 raise RecordingError(f"Could not save the recording and metadata: {exc}") from exc
             raise
 
-        self._video.unlink()
         staged_json.unlink()
-        if self.on_accept is not None:
-            self.on_accept(pending)
-        self.accepted.append(pending)
-        self.pending = None
-        self.notice = f"Sample {pending.repetition} saved."
-        self.state = State.COMPLETED if len(self.accepted) == self.config.repetitions else State.READY
 
     def _show(self, frame, *, elapsed=0.0, controls=None):
         if frame is None:
