@@ -9,16 +9,20 @@ from time import perf_counter
 
 import av
 
-from config import HandExtractionConfig
-
 from dataset_export.reader import DatasetReader
 from landmarks.decoder import VideoDecoder
-from landmarks.exceptions import DatasetAccessError, EmptyInterval, FrameProcessingError, SampleNotFound, SourceVideoError
+from landmarks.exceptions import (
+    DatasetAccessError, EmptyInterval, FrameProcessingError, HandInferenceError, PoseInferenceError,
+    SampleNotFound, SourceVideoError,
+)
 from landmarks.hand_metrics import aggregate_hand_metrics, hand_metrics, no_hand_warnings
 from landmarks.hands import HandExtractor
+from landmarks.pose import PoseExtractor
+from landmarks.pose_metrics import PoseQualityMetrics, aggregate_pose_metrics
 from landmarks.sampler import FrameSampler
 from landmarks.schemas import (
-    HAND_SCHEMA_VERSION, HAND_SLOTS, BatchSummary, DecodedFrame, HandArrays, HandExtractionResult, ProcessingSummary,
+    HAND_SCHEMA_VERSION, HAND_SLOTS, POSE_SCHEMA_VERSION, BatchSummary, DecodedFrame, HandArrays,
+    HandExtractionResult, PoseArrays, PoseExtractionResult, ProcessingSummary,
 )
 from registry import datasets
 from registry.database import Database, RegistryError
@@ -83,6 +87,7 @@ class DecodingService:
         summary = ProcessingSummary(
             record.sample_id, dataset_name=self.reader.metadata["name"], dataset_version=self.reader.metadata["version"],
             source_video_path=str(record.video_path),
+            dataset_id=self.reader.metadata["dataset_id"], annotation_id=record.annotation.id,
             start_ms=record.annotation.start_ms, end_ms=record.annotation.end_ms,
             width=record.width, height=record.height, source_fps=record.average_fps, rotation_degrees=record.rotation,
         )
@@ -184,15 +189,15 @@ def _processing_run(summary, decoder_factory, fps, all_frames, check_permission=
     return ProcessingRun(summary, frames())
 
 
-class HandExtractionService:
-    """Extract one approved sample at a time through the Phase 2.1 pipeline."""
+class LandmarkExtractionService:
+    """Share the single-video and approved batch lifecycle across landmark tasks."""
 
-    def __init__(self, decoding: DecodingService | None, config: HandExtractionConfig, *, extractor_factory=HandExtractor):
+    def __init__(self, decoding: DecodingService | None, config, *, extractor_factory=None):
         self.decoding = decoding
         self.config = config
-        self.extractor_factory = extractor_factory
+        self.extractor_factory = extractor_factory or self.extractor_type
 
-    def process(self, sample_id: str, *, on_frame=None) -> HandExtractionResult:
+    def process(self, sample_id: str, *, on_frame=None):
         if self.decoding is None:
             raise DatasetAccessError("An approved dataset is required to process a sample ID.")
         try:
@@ -200,10 +205,10 @@ class HandExtractionService:
         except FrameProcessingError as exc:
             report = self._report(sample_id, diagnostic=False)
             self._record_failure(report, exc)
-            return HandExtractionResult(report)
+            return self.result_type(report)
         return self._extract(run, diagnostic=False, on_frame=on_frame)
 
-    def inspect_file(self, path: Path, *, fps: float = 30, all_frames: bool = False) -> HandExtractionResult:
+    def inspect_file(self, path: Path, *, fps: float = 30, all_frames: bool = False):
         return self._extract(inspect_file(path, fps=fps, all_frames=all_frames), diagnostic=True)
 
     def inspect_dataset(self) -> dict:
@@ -233,31 +238,35 @@ class HandExtractionService:
                 sample["frames"] = []
         complete = [sample for sample in samples if sample["status"] == "PROCESSED"]
         return {
-            "schema_version": HAND_SCHEMA_VERSION,
+            "schema_version": self.schema_version,
             "dataset": metadata["name"], "version": metadata["version"],
             "total_samples": metadata["total_samples"], "processed": len(complete),
             "failed": sum(sample["status"] == "FAILED" for sample in samples),
             "cancelled": cancelled,
             "dataset_error": dataset_error,
-            "metrics": aggregate_hand_metrics([sample["metrics"] for sample in complete]),
+            "metrics": self.aggregate_metrics([sample["metrics"] for sample in complete]),
             "samples": samples,
         }
 
     def _report(self, sample_id: str, *, diagnostic: bool) -> dict:
-        return {
+        report = {
             "sample_id": sample_id,
             "source": "diagnostic_file" if diagnostic else "approved_dataset",
-            "schema_version": HAND_SCHEMA_VERSION,
-            "slots": list(HAND_SLOTS),
+            "schema_version": self.schema_version,
             "model_sha256": None,
             "mediapipe_version": None,
             "configuration": {
                 **asdict(self.config), "model_path": str(self.config.model_path),
-                "num_hands": 2, "running_mode": "VIDEO", "timestamp_rounding": "floor_milliseconds",
+                "running_mode": "VIDEO", "timestamp_rounding": "floor_milliseconds", **self.task_configuration,
             },
             "status": "PENDING", "error_code": None, "error": None,
-            "warnings": [], "frames": [], "metrics": hand_metrics([], 0.0),
+            "warnings": [], "frames": [], "metrics": self.aggregate_metrics([]),
         }
+        self._enrich_report(report)
+        return report
+
+    def _enrich_report(self, report):
+        pass
 
     @staticmethod
     def _record_failure(report: dict, exc: FrameProcessingError) -> None:
@@ -266,7 +275,7 @@ class HandExtractionService:
         if isinstance(exc, DatasetAccessError):
             report["frames"] = []
 
-    def _extract(self, run: ProcessingRun, *, diagnostic: bool, on_frame=None) -> HandExtractionResult:
+    def _extract(self, run: ProcessingRun, *, diagnostic: bool, on_frame=None):
         report = self._report(run.summary.sample_id, diagnostic=diagnostic)
         started = perf_counter()
         display_seconds = 0.0
@@ -287,8 +296,11 @@ class HandExtractionService:
                             display_seconds += perf_counter() - display_started
                 else:
                     if not frames:
-                        raise EmptyInterval("No sampled frames were available for hand extraction.")
-                    arrays = HandArrays.from_frames(frames)
+                        raise EmptyInterval(f"No sampled frames were available for {self.kind} extraction.")
+                    try:
+                        arrays = self.array_type.from_frames(frames)
+                    except ValueError as exc:
+                        raise self.inference_error(str(exc)) from exc
                     report["status"] = "PROCESSED"
                 if arrays is None:
                     report["status"] = "CANCELLED"
@@ -297,7 +309,7 @@ class HandExtractionService:
             self._record_failure(report, exc)
         except KeyboardInterrupt:
             arrays = None
-            report.update(status="CANCELLED", error_code="INTERRUPTED", error="Hand extraction was interrupted.")
+            report.update(status="CANCELLED", error_code="INTERRUPTED", error=f"{self.kind.capitalize()} extraction was interrupted.")
             report["warnings"].append({"code": "INTERRUPTED"})
         finally:
             report["model_sha256"] = extractor.model_sha256
@@ -305,19 +317,99 @@ class HandExtractionService:
             report["decoding"] = asdict(run.summary)
             for issue in run.summary.timestamp_irregularities:
                 report["warnings"].append({"code": "DECODER_TIMESTAMP_IRREGULARITY", **asdict(issue)})
-            report["warnings"].extend(no_hand_warnings(
-                frames, self.config.no_hand_warning_ms, completed=report["status"] == "PROCESSED",
-            ))
-            report["frames"] = [
-                {
-                    "frame_index": frame.frame_index, "timestamp_ms": frame.timestamp_ms,
-                    "raw_image_detections": frame.raw_image_detections,
-                    "ambiguous_handedness": frame.ambiguous_handedness,
-                    "invalid_landmark_values": frame.invalid_landmark_values,
-                    "detections": frame.detections, "warnings": frame.warnings,
-                }
-                for frame in frames
-                if report["error_code"] != DatasetAccessError.code
-            ]
-            report["metrics"] = hand_metrics(frames, max(0.0, perf_counter() - started - display_seconds))
-        return HandExtractionResult(report, arrays)
+            seconds = max(0.0, perf_counter() - started - display_seconds)
+            metrics, warnings = self._analyze(frames, seconds, extractor, run.summary, report["status"])
+            report["metrics"] = metrics
+            report["warnings"].extend(warnings)
+            if report["error_code"] != DatasetAccessError.code:
+                report["frames"] = [self._frame_report(frame) for frame in frames]
+        return self.result_type(report, arrays)
+
+
+class HandExtractionService(LandmarkExtractionService):
+    kind = "hand"
+    extractor_type = HandExtractor
+    array_type = HandArrays
+    result_type = HandExtractionResult
+    inference_error = HandInferenceError
+    schema_version = HAND_SCHEMA_VERSION
+    task_configuration = {"num_hands": 2}
+    aggregate_metrics = staticmethod(aggregate_hand_metrics)
+
+    def _enrich_report(self, report):
+        report["slots"] = list(HAND_SLOTS)
+
+    def _analyze(self, frames, seconds, extractor, summary, status):
+        return hand_metrics(frames, seconds), no_hand_warnings(
+            frames, self.config.no_hand_warning_ms, completed=status == "PROCESSED",
+        )
+
+    @staticmethod
+    def _frame_report(frame):
+        return {
+            "frame_index": frame.frame_index, "timestamp_ms": frame.timestamp_ms,
+            "raw_image_detections": frame.raw_image_detections,
+            "ambiguous_handedness": frame.ambiguous_handedness,
+            "invalid_landmark_values": frame.invalid_landmark_values,
+            "detections": frame.detections, "warnings": frame.warnings,
+        }
+
+
+class PoseExtractionService(LandmarkExtractionService):
+    kind = "pose"
+    extractor_type = PoseExtractor
+    array_type = PoseArrays
+    result_type = PoseExtractionResult
+    inference_error = PoseInferenceError
+    schema_version = POSE_SCHEMA_VERSION
+    task_configuration = {
+        "num_poses": 1, "output_segmentation_masks": False,
+        "inference_clock": "source_ms_with_explicit_rebase_or_collision_adjustment",
+    }
+    aggregate_metrics = staticmethod(aggregate_pose_metrics)
+
+    def __init__(self, decoding, config, *, extractor_factory=None, multiple_participant_samples=()):
+        super().__init__(decoding, config, extractor_factory=extractor_factory)
+        self.multiple_participant_samples = {sample.strip().lower() for sample in multiple_participant_samples}
+
+    def _enrich_report(self, report):
+        report["model_variant"] = self.config.model_variant
+        report["annotation_id"] = None
+        report["dataset"] = None
+        if report["source"] == "approved_dataset":
+            metadata = self.decoding.reader.metadata
+            report["dataset"] = {
+                "id": metadata["dataset_id"], "name": metadata["name"], "version": metadata["version"],
+            }
+        if report["sample_id"].strip().lower() in self.multiple_participant_samples:
+            report["warnings"].append({"code": "POSSIBLE_MULTIPLE_PARTICIPANTS", "source": "human_review"})
+
+    def _extract(self, run, **kwargs):
+        result = super()._extract(run, **kwargs)
+        result.report["annotation_id"] = run.summary.annotation_id
+        return result
+
+    def _analyze(self, frames, seconds, extractor, summary, status):
+        rates = [rate for rate in (summary.source_fps, summary.target_fps) if rate]
+        metrics, warnings = PoseQualityMetrics(self.config).evaluate(
+            frames, seconds, extractor.initialization_seconds, nominal_fps=min(rates) if rates else None,
+        )
+        metrics["timestamp_discontinuities"] += len(summary.timestamp_irregularities)
+        if status == "PROCESSED" and not metrics["frames_with_raw_pose"]:
+            warnings.append({"code": "NO_POSES_DETECTED"})
+        return metrics, warnings
+
+    @staticmethod
+    def _frame_report(frame):
+        warnings = list(frame.warnings)
+        if frame.inference_timestamp_ms != frame.timestamp_ms:
+            warnings.append({"code": "POSE_INFERENCE_TIMESTAMP_ADJUSTED"})
+        return {
+            "frame_index": frame.frame_index, "timestamp_ms": frame.timestamp_ms,
+            "source_pts_ms": {
+                "numerator": frame.source_timestamp.numerator, "denominator": frame.source_timestamp.denominator,
+            },
+            "inference_timestamp_ms": frame.inference_timestamp_ms,
+            "pose_detected": frame.pose_detected, "world_available": frame.world_available,
+            "raw_pose_count": frame.raw_pose_count, "invalid": frame.invalid, "warnings": warnings,
+        }

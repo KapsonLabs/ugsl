@@ -25,6 +25,15 @@ def _json(value):
     typer.echo(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False))
 
 
+def finish_extraction(result, *, allow_early_exit=False):
+    report = result.report
+    _json(report)
+    if report["status"] == "FAILED":
+        raise typer.Exit(1)
+    if report["status"] == "CANCELLED" and (report["error_code"] or not allow_early_exit):
+        raise typer.Exit(130)
+
+
 def _service(ctx, dataset, version, path, storage_root, fps, all_frames):
     from landmarks.service import DecodingService
 

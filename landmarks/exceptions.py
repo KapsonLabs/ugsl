@@ -69,3 +69,15 @@ class HandInferenceError(FrameProcessingError):
 
 class HandOutputError(FrameProcessingError):
     code = "HAND_OUTPUT_FAILED"
+
+
+class PoseModelError(FrameProcessingError):
+    code = "POSE_MODEL_ERROR"
+
+
+class PoseInferenceError(FrameProcessingError):
+    code = "POSE_INFERENCE_FAILED"
+
+
+class PoseOutputError(FrameProcessingError):
+    code = "POSE_OUTPUT_FAILED"

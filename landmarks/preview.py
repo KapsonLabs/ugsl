@@ -4,11 +4,13 @@ import os
 import sys
 from contextlib import suppress
 from pathlib import Path
+from time import monotonic
 
 import cv2
 import numpy as np
 
 from landmarks.exceptions import FrameProcessingError
+from landmarks.schemas import DecodedFrame, HandFrame, PoseFrame
 
 WINDOW = "UGSL Sampled Frames"
 RIGHT = {65363, 2555904, 63235, 3}
@@ -91,3 +93,54 @@ def save_contact_sheet(run, destination: Path, limit: int) -> None:
         raise FrameProcessingError("Could not create the OpenCV contact sheet.") from exc
     except OSError as exc:
         raise FrameProcessingError("Could not save the contact sheet. Use a new path in a writable directory.") from exc
+
+
+class LandmarkPlayback:
+    """Display task overlays at the sampled source cadence when inference keeps up."""
+
+    window: str
+
+    @staticmethod
+    def _caption(canvas, text, at, color, scale):
+        cv2.putText(canvas, text, at, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(canvas, text, at, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+
+    def __enter__(self):
+        if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            raise FrameProcessingError("OpenCV playback requires a graphical desktop session.")
+        try:
+            cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
+        except cv2.error as exc:
+            raise FrameProcessingError("Could not open an OpenCV playback window.") from exc
+        self._last_timestamp = self._last_display = None
+        return self
+
+    def __exit__(self, *_):
+        with suppress(cv2.error):
+            cv2.destroyWindow(self.window)
+
+    def show(self, frame: DecodedFrame, landmarks: HandFrame | PoseFrame) -> bool:
+        """Play at source cadence when inference keeps up. Q or Escape ends playback."""
+        try:
+            canvas = self.render(frame, landmarks)
+            now = monotonic()
+            if self._last_timestamp is not None:
+                deadline = self._last_display + (landmarks.timestamp_ms - self._last_timestamp) / 1000
+                while now < deadline:
+                    if not self._wait(min(50, max(1, round(1000 * (deadline - now))))):
+                        return False
+                    now = monotonic()
+            cv2.imshow(self.window, canvas)
+            self._last_timestamp, self._last_display = landmarks.timestamp_ms, monotonic()
+            return self._wait(1)
+        except cv2.error as exc:
+            raise FrameProcessingError("Could not display the landmark playback.") from exc
+
+    def _wait(self, delay_ms: int) -> bool:
+        key = cv2.waitKeyEx(delay_ms)
+        if key in (ord("q"), ord("Q"), 27):
+            return False
+        with suppress(cv2.error):
+            if cv2.getWindowProperty(self.window, cv2.WND_PROP_VISIBLE) == 0:
+                return False
+        return True

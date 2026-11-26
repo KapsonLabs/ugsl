@@ -159,11 +159,60 @@ class HandExtractionConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_path", Path(self.model_path).expanduser())
-        for name in ("min_detection_confidence", "min_presence_confidence", "min_tracking_confidence"):
-            value = getattr(self, name)
-            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
-                raise ValueError(f"{name} must be a finite number from 0 to 1.")
+        _validate_landmark_thresholds(self)
         if type(self.mirrored_input) is not bool:
             raise ValueError("mirrored_input must be Boolean.")
         if type(self.no_hand_warning_ms) is not int or self.no_hand_warning_ms < 1:
             raise ValueError("no_hand_warning_ms must be a positive integer.")
+
+
+def _validate_landmark_thresholds(config, *extra: str) -> None:
+    for name in ("min_detection_confidence", "min_presence_confidence", "min_tracking_confidence", *extra):
+        value = getattr(config, name)
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"{name} must be a finite number from 0 to 1.")
+
+
+POSE_MODEL_VARIANTS = ("lite", "full", "heavy")
+POSE_MODEL_PATHS = {
+    variant: HAND_MODEL_PATH.parent / f"pose_landmarker_{variant}.task" for variant in POSE_MODEL_VARIANTS
+}
+
+
+@dataclass(frozen=True)
+class PoseExtractionConfig:
+    """MediaPipe inference settings and pose diagnostic thresholds."""
+
+    model_path: Path | None = None
+    model_variant: str | None = None
+    min_detection_confidence: float = 0.5
+    min_presence_confidence: float = 0.5
+    min_tracking_confidence: float = 0.5
+    visibility_threshold: float = 0.5
+    presence_threshold: float = 0.5
+    timestamp_gap_ms: int = 250
+    displacement_threshold: float = 0.25
+
+    def __post_init__(self) -> None:
+        requested = self.model_variant
+        if requested is not None and requested not in POSE_MODEL_VARIANTS:
+            raise ValueError("Pose model variant must be lite, full, or heavy.")
+        if self.model_path is None:
+            variant = requested or "full"
+            path = POSE_MODEL_PATHS[variant]
+        else:
+            path = Path(self.model_path).expanduser()
+            inferred = next((key for key, asset in POSE_MODEL_PATHS.items() if path.name == asset.name), None)
+            if requested is not None and inferred is not None and requested != inferred:
+                raise ValueError("The pose model path and selected model variant disagree.")
+            variant = requested or inferred or "custom"
+        object.__setattr__(self, "model_variant", variant)
+        object.__setattr__(self, "model_path", path)
+        _validate_landmark_thresholds(self, "visibility_threshold", "presence_threshold")
+        if type(self.timestamp_gap_ms) is not int or self.timestamp_gap_ms < 1:
+            raise ValueError("timestamp_gap_ms must be a positive integer.")
+        if (
+            type(self.displacement_threshold) not in (int, float)
+            or not math.isfinite(self.displacement_threshold) or self.displacement_threshold <= 0
+        ):
+            raise ValueError("displacement_threshold must be a finite positive number.")

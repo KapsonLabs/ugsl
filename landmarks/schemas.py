@@ -1,7 +1,9 @@
 """Exact internal timing and serializable processing reports."""
 
 from dataclasses import dataclass, field
+from enum import IntEnum
 from fractions import Fraction
+from itertools import pairwise
 
 import numpy as np
 
@@ -64,6 +66,8 @@ class ProcessingSummary:
     error: str | None = None
     decoder_configuration: dict = field(default_factory=dict)
     implementation_version: str = "1.0"
+    dataset_id: str | None = None
+    annotation_id: str | None = None
 
 
 @dataclass
@@ -157,3 +161,149 @@ class HandArrays:
 class HandExtractionResult:
     report: dict
     arrays: HandArrays | None = None
+
+
+POSE_SCHEMA_VERSION = "1.0"
+
+
+class PoseLandmark(IntEnum):
+    """MediaPipe Pose Landmarker landmark order."""
+
+    NOSE = 0
+    LEFT_EYE_INNER = 1
+    LEFT_EYE = 2
+    LEFT_EYE_OUTER = 3
+    RIGHT_EYE_INNER = 4
+    RIGHT_EYE = 5
+    RIGHT_EYE_OUTER = 6
+    LEFT_EAR = 7
+    RIGHT_EAR = 8
+    MOUTH_LEFT = 9
+    MOUTH_RIGHT = 10
+    LEFT_SHOULDER = 11
+    RIGHT_SHOULDER = 12
+    LEFT_ELBOW = 13
+    RIGHT_ELBOW = 14
+    LEFT_WRIST = 15
+    RIGHT_WRIST = 16
+    LEFT_PINKY = 17
+    RIGHT_PINKY = 18
+    LEFT_INDEX = 19
+    RIGHT_INDEX = 20
+    LEFT_THUMB = 21
+    RIGHT_THUMB = 22
+    LEFT_HIP = 23
+    RIGHT_HIP = 24
+    LEFT_KNEE = 25
+    RIGHT_KNEE = 26
+    LEFT_ANKLE = 27
+    RIGHT_ANKLE = 28
+    LEFT_HEEL = 29
+    RIGHT_HEEL = 30
+    LEFT_FOOT_INDEX = 31
+    RIGHT_FOOT_INDEX = 32
+
+
+POSE_LANDMARK_COUNT = len(PoseLandmark)
+POSE_GROUPS = {
+    "upper_body": tuple(range(25)),
+    "head": tuple(range(11)),
+    "shoulders": (11, 12),
+    "arms": (11, 12, 13, 14, 15, 16),
+    "elbows": (13, 14),
+    "wrists": (15, 16),
+    "hand_reference": (15, 16, 17, 18, 19, 20, 21, 22),
+    "torso": (11, 12, 23, 24),
+    "lower_body": tuple(range(23, POSE_LANDMARK_COUNT)),
+}
+
+
+@dataclass(eq=False)
+class PoseFrame:
+    frame_index: int
+    source_timestamp: Fraction
+    timestamp_ms: int
+    inference_timestamp_ms: int
+    image_landmarks: np.ndarray = field(default_factory=lambda: np.full((POSE_LANDMARK_COUNT, 3), np.nan, dtype=np.float32))
+    world_landmarks: np.ndarray = field(default_factory=lambda: np.full((POSE_LANDMARK_COUNT, 3), np.nan, dtype=np.float32))
+    visibility: np.ndarray = field(default_factory=lambda: np.full(POSE_LANDMARK_COUNT, np.nan, dtype=np.float32))
+    presence_scores: np.ndarray = field(default_factory=lambda: np.full(POSE_LANDMARK_COUNT, np.nan, dtype=np.float32))
+    pose_detected: bool = False
+    world_available: bool = False
+    raw_pose_count: int = 0
+    invalid: bool = False
+    warnings: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True, eq=False)
+class PoseArrays:
+    image_landmarks: np.ndarray
+    world_landmarks: np.ndarray
+    visibility: np.ndarray
+    presence_scores: np.ndarray
+    pose_detected: np.ndarray
+    world_available: np.ndarray
+    timestamps_ms: np.ndarray
+    frame_indices: np.ndarray
+    inference_timestamps_ms: np.ndarray
+    schema_version: str = POSE_SCHEMA_VERSION
+
+    @classmethod
+    def from_frames(cls, frames: list[PoseFrame]) -> "PoseArrays":
+        if not frames:
+            raise ValueError("Cannot build pose arrays without processed frames.")
+        if any(frame.source_timestamp // 1 != frame.timestamp_ms for frame in frames):
+            raise ValueError("Pose milliseconds must align with the exact source timestamps.")
+        if any(previous.source_timestamp >= current.source_timestamp for previous, current in pairwise(frames)):
+            raise ValueError("Exact source timestamps must be strictly increasing.")
+        return cls(
+            np.stack([frame.image_landmarks for frame in frames]),
+            np.stack([frame.world_landmarks for frame in frames]),
+            np.stack([frame.visibility for frame in frames]),
+            np.stack([frame.presence_scores for frame in frames]),
+            np.array([frame.pose_detected for frame in frames], dtype=np.bool_),
+            np.array([frame.world_available for frame in frames], dtype=np.bool_),
+            np.array([frame.timestamp_ms for frame in frames], dtype=np.int64),
+            np.array([frame.frame_index for frame in frames], dtype=np.int64),
+            np.array([frame.inference_timestamp_ms for frame in frames], dtype=np.int64),
+        )
+
+    def __post_init__(self):
+        count = self.timestamps_ms.size
+        points = (count, POSE_LANDMARK_COUNT)
+        for name, shape, dtype in (
+            ("image_landmarks", (*points, 3), np.float32),
+            ("world_landmarks", (*points, 3), np.float32),
+            ("visibility", points, np.float32),
+            ("presence_scores", points, np.float32),
+            ("pose_detected", (count,), np.bool_),
+            ("world_available", (count,), np.bool_),
+            ("timestamps_ms", (count,), np.int64),
+            ("frame_indices", (count,), np.int64),
+            ("inference_timestamps_ms", (count,), np.int64),
+        ):
+            values = getattr(self, name)
+            if values.shape != shape or values.dtype != dtype:
+                raise ValueError(f"Pose array {name} must have shape {shape} and dtype {np.dtype(dtype)}.")
+        if np.any(self.timestamps_ms[1:] < self.timestamps_ms[:-1]):
+            raise ValueError("Source timestamps must be nondecreasing.")
+        for values in (self.frame_indices, self.inference_timestamps_ms):
+            if count and (values[0] < 0 or np.any(values[1:] <= values[:-1])):
+                raise ValueError("Source indices and inference timestamps must be nonnegative and strictly increasing.")
+        if np.any(self.world_available & ~self.pose_detected):
+            raise ValueError("World landmarks require a valid image pose.")
+        for values, mask in (
+            (self.image_landmarks, self.pose_detected), (self.world_landmarks, self.world_available),
+        ):
+            if not np.isfinite(values[mask]).all() or not np.isnan(values[~mask]).all():
+                raise ValueError("Pose coordinates must be finite when available and NaN otherwise.")
+        for values in (self.visibility, self.presence_scores):
+            valid = values[~np.isnan(values)]
+            if not np.all((valid >= 0) & (valid <= 1)) or not np.isnan(values[~self.pose_detected]).all():
+                raise ValueError("Pose scores must be between 0 and 1 or NaN where unavailable.")
+
+
+@dataclass(frozen=True, eq=False)
+class PoseExtractionResult:
+    report: dict
+    arrays: PoseArrays | None = None

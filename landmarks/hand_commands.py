@@ -1,12 +1,12 @@
 """UGSL hand extraction, inspection, and playback commands."""
 
-import json
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from config import HAND_MODEL_PATH, HandExtractionConfig
+from landmarks.commands import _json, finish_extraction
 from landmarks.exceptions import FrameProcessingError
 from landmarks.service import DecodingService, HandExtractionService
 from registry.commands import database, report_errors
@@ -50,19 +50,6 @@ def _registered(ctx, dataset, version) -> HandExtractionService:
     )
 
 
-def _json(report):
-    typer.echo(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
-
-
-def _finish(result, *, allow_early_exit=False):
-    report = result.report
-    _json(report)
-    if report["status"] == "FAILED":
-        raise typer.Exit(1)
-    if report["status"] == "CANCELLED" and (report["error_code"] or not allow_early_exit):
-        raise typer.Exit(130)
-
-
 @hands_app.command("extract")
 @report_errors
 def extract(
@@ -79,7 +66,7 @@ def extract(
             export_debug(result, output, check_permission=service.decoding.reader.check_permission)
         except FrameProcessingError as exc:
             service._record_failure(result.report, exc)
-    _finish(result)
+    finish_extraction(result)
 
 
 @hands_app.command("visualize")
@@ -94,7 +81,7 @@ def visualize(
     service = _registered(ctx, dataset, version)
     with HandLandmarkVisualizer(skeleton_only=skeleton_only) as preview:
         result = service.process(sample_id, on_frame=preview.show)
-    _finish(result, allow_early_exit=True)
+    finish_extraction(result, allow_early_exit=True)
 
 
 @hands_app.command("inspect")
@@ -103,7 +90,7 @@ def inspect_sample(
     ctx: typer.Context, sample_id: str, dataset: Annotated[str, DATASET], version: Annotated[str, VERSION],
 ):
     """Print metrics and diagnostics for an approved sample."""
-    _finish(_registered(ctx, dataset, version).process(sample_id))
+    finish_extraction(_registered(ctx, dataset, version).process(sample_id))
 
 
 @hands_app.command("inspect-file")
@@ -111,7 +98,7 @@ def inspect_sample(
 def inspect_direct_file(ctx: typer.Context, path: Path):
     """Inspect a diagnostic video without reading or updating registry data."""
     config, fps, all_frames = ctx.meta["ugsl_hands"]
-    _finish(HandExtractionService(None, config).inspect_file(path, fps=fps, all_frames=all_frames))
+    finish_extraction(HandExtractionService(None, config).inspect_file(path, fps=fps, all_frames=all_frames))
 
 
 @hands_app.command("inspect-dataset")

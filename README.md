@@ -675,3 +675,135 @@ waits.
 Run `python -m pytest` for the automated suite. To include the native model
 smoke test from a session with graphics-service access, run
 `UGSL_RUN_NATIVE_HAND_TEST=1 python -m pytest`.
+
+
+## Phase 2.3 body pose landmark extraction
+
+The `pose` commands process registered reference and portable exports through
+the same approved intervals, permission checks, and PyAV sampling used by
+`hands`. Both groups default to 30 fps and accept `--fps` and `--all-frames`.
+Use the same sampling options when comparing timestamps from the two tasks.
+
+### Models
+
+The default is Google's official Pose Landmarker **Full float16 v1** bundle at
+`models/pose_landmarker_full.task`. The SHA-256 is
+`5134a3aad27a58b93da0088d431f366da362b44e3ccfbe3462b3827a839011b1`.
+The extraction report hashes the exact bundle passed to the installed runtime.
+MediaPipe **0.10.35** was tested with Full, Lite, and Heavy.
+
+```bash
+shasum -a 256 -c models/pose_landmarker_full.task.sha256
+```
+
+Download the [official Lite](https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task),
+[official Full](https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task),
+or [official Heavy](https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task)
+bundle to a new local path if needed. To use a standard filename in `models/`,
+select `pose --model-variant lite`, `full`, or `heavy`. To use any local
+location, pass `--model-path PATH` after the command, or set
+`UGSL_POSE_MODEL`. A nonstandard filename is labeled `custom` in the report
+unless the operator names a variant explicitly. Extraction only reads the
+local model and reports an error if it is missing or incompatible.
+[MediaPipe Pose Landmarker documentation](https://developers.google.com/edge/mediapipe/solutions/vision/pose_landmarker?tab=Python)
+
+### CLI
+
+```bash
+python cli.py pose extract SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0 --output ./debug/
+python cli.py pose inspect SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0
+python cli.py pose visualize SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0
+python cli.py pose visualize SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0 --full-body --skeleton-only --show-indices
+python cli.py pose inspect SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0 --model-path models/pose_landmarker_lite.task
+python cli.py pose inspect-file ./test-video.mp4
+python cli.py pose inspect-dataset --dataset ugsl-isolated-signs --version 1.0.0
+```
+
+Group options include `--detection-confidence`, `--presence-confidence`, and
+`--tracking-confidence` (all default to 0.5). Playback defaults to upper body.
+Use `--show-visibility` to display scores, `--mirror-preview` to flip playback
+only, and Q or Escape to exit. The group option `--visibility-threshold`
+controls whether a point or its connections are displayed.
+
+The model is configured for one pose. If another person is in the image, the
+selected pose may belong to them. The model cannot reliably count participants
+in this mode. Use `--multiple-participants` on a single sample or diagnostic
+clip to record a human-review flag. Use repeated
+`--multiple-participant-sample SAMPLE_ID` options on a batch to pass flags from
+review or external metadata.
+
+`inspect-file` is diagnostic and produces a report without a dataset record.
+An approved sample processed with `--output` writes
+`debug/SAMPLE_ID/pose_landmarks.npz` and `pose_extraction_report.json`.
+The two pose files can share the directory with the hand debug files. Existing
+artifacts are protected, and access is checked again before publication.
+A missing or corrupt video is a sample failure. A dataset permission failure
+stops the batch. A successfully decoded clip with zero valid poses still
+retains all selected times and frame indices.
+
+### Arrays and metrics
+
+The schema is `1.0`. All 33 landmarks retain MediaPipe's original order.
+The anatomical grouping for upper-body playback and metrics is defined
+in `landmarks/schemas.py`. Upper body covers indices 0–24, including the hips.
+Coordinates use float32 precision and keep their original scale and axes.
+The world arrays contain model estimates relative to the pose model's origin.
+Pose and hand world coordinates have separate origins.
+
+| NPZ key | Shape | Type |
+| --- | --- | --- |
+| `image_landmarks`, `world_landmarks` | `(T, 33, 3)` | float32 |
+| `visibility`, `presence_scores` | `(T, 33)` | float32 |
+| `pose_detected`, `world_available` | `(T,)` | bool |
+| `timestamps_ms`, `frame_indices`, `inference_timestamps_ms` | `(T,)` | int64 |
+| `schema_version` | scalar | Unicode string |
+
+`timestamps_ms` stores floored source PTS. Each frame's JSON record also
+stores exact PTS as a fraction. MediaPipe normally receives the same
+millisecond value. If the first source PTS is outside the native timestamp
+range, the inference clock starts at zero. If distinct source times round
+to the same millisecond, the inference clock advances by the minimum
+required millisecond. The report records every changed inference time.
+Non-increasing exact source times are rejected.
+
+A frame with no valid image pose has false masks and NaN arrays. A malformed
+image pose masks that frame's pose and records an invalid result. A missing
+or malformed world pose masks only the world coordinates. Missing scores are
+NaN, and invalid scores are masked individually and flagged. Valid
+out-of-frame coordinates remain in the arrays. Playback omits points it
+cannot draw safely.
+
+Detection coverage uses valid image poses. Visibility and presence coverage
+count frames where the corresponding score meets its threshold, divided by
+all processed frames. Averages use available scores. Missing-pose intervals
+end at the next valid frame, or at the last observed timestamp for a trailing
+interval. Gap diagnostics use the larger of `--timestamp-gap-ms` (250 ms by
+default) and two nominal frame periods. Displacement warnings compare adjacent
+upper-body XY landmarks that meet both visibility and presence thresholds.
+Large jumps can be legitimate signing motion. These diagnostics leave review
+status untouched and do not measure linguistic correctness.
+
+### Manual test with real signer recordings
+
+1. Inspect one approved signer video with the hands and shoulders visible.
+   Check the annotation ID, source frame indices, and timestamps against
+   `frames sample` with the same sampling options.
+2. Play it with the default upper-body overlay, then use `--full-body`,
+   `--skeleton-only`, `--show-indices`, and `--show-visibility`. Check the
+   anatomical left and right sides, elbows, wrists, and hips. Repeat with
+   `--mirror-preview` and compare the exported coordinates.
+3. Inspect a clip with the signer leaving the frame, a seated clip, and a
+   clip with partially obscured arms. Verify that missing poses retain their
+   frames, uncertain points respect the display threshold, and low
+   lower-body visibility does not block the extraction.
+4. Review a clip where another person is visible. Pass the participant flag
+   and verify the report records it. Check visually which person is tracked.
+5. Open a debug NPZ with `numpy.load(path, allow_pickle=False)`. Verify the
+   33-landmark order, source/inference times, NaN masks, and separate
+   world coordinates. Use a disposable dataset to verify a revoked version
+   cannot produce a debug export.
+
+Run `python -m pytest` for the automated suite. From a session with graphics
+service access, use
+`UGSL_RUN_NATIVE_HAND_TEST=1 UGSL_RUN_NATIVE_POSE_TEST=1 python -m pytest`
+to include the native checks.
