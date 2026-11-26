@@ -13,3 +13,5 @@ datasets/quarantine/*
 !datasets/quarantine/.gitkeep
 datasets/exports/*
 !datasets/exports/.gitkeep
+
+/debug/

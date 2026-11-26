@@ -12,6 +12,8 @@ from dataset_export import commands as dataset_commands
 from ingestion import commands as media_commands
 from ingestion.capture import CameraCapture
 from ingestion.exceptions import CaptureError, MediaError
+from landmarks import commands as frames_commands
+from landmarks import hand_commands
 from registry import commands
 from registry.database import RegistryError
 from services.recording_service import capture_registered
@@ -22,6 +24,8 @@ commands.mount(app)
 media_commands.mount(app)
 linguistic_commands.mount(app)
 dataset_commands.mount(app)
+frames_commands.mount(app)
+hand_commands.mount(app)
 
 
 @app.callback()

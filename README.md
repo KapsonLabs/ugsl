@@ -1,6 +1,6 @@
-# UGSL Recognition Engine · Phase 1.5
+# UGSL Recognition Engine · Phase 2.1
 
-Collect labelled Ugandan Sign Language video samples and manage the dataset in a local SQLite registry. Operators record takes in OpenCV or import existing local video files. Both paths run through the same technical checks before storing the original video bytes and registering the sample. The registry links each sample to a vocabulary entry and a recording session for an eligible signer. Human annotators mark the sign interval, and linguistic reviewers verify the annotation before the sample becomes training-eligible. Versioned exports freeze the approved clips, annotation intervals, and class mapping for isolated-sign training.
+Collect labelled Ugandan Sign Language video samples and manage the dataset in a local SQLite registry. Operators record takes in OpenCV or import existing local video files. Both paths run through the same technical checks before storing the original video bytes and registering the sample. The registry links each sample to a vocabulary entry and a recording session for an eligible signer. Human annotators mark the sign interval, and linguistic reviewers verify the annotation before the sample becomes training-eligible. Versioned exports freeze the approved clips, annotation intervals, and class mapping for isolated-sign training. Phase 2.1 streams timestamped RGB frames from those exports.
 
 ## Install
 
@@ -432,6 +432,49 @@ The registry is authoritative. Explicit revocation and the CLI consent and corre
 
 A new export reserves its version and membership in `BUILDING`, writes and verifies a private staging folder, then rechecks approval and consent before renaming and activating it. A build marker blocks use until activation finishes. Reconciliation can finalize a complete eligible build or mark an incomplete build `FAILED`. Staged files from failed or revoked builds remain private for inspection and custodian-directed cleanup. Dry-run performs no cleanup or lifecycle changes.
 
+## Decode and sample approved frames
+
+Replace `SAMPLE_ID` with an exported sample UUID. The commands use the approved annotation in that dataset version.
+
+```bash
+python cli.py frames inspect SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0
+python cli.py frames sample SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0 --fps 30
+python cli.py frames sample SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0 --all-frames
+python cli.py frames preview SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0
+python cli.py frames contact-sheet SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0 --output preview.png
+python cli.py frames validate-dataset --dataset ugsl-isolated-signs --version 1.0.0 --fps 30
+python cli.py frames inspect-file ./test-video.mp4
+```
+
+Use `--path` instead of a name and version for a moved export. Reference exports need the matching `--storage-root` or `UGSL_REFERENCE_ROOT`. Provide the registry with the global `--db` option when it is available. Named datasets use their registered root by default. PyAV decodes local video in the five containers supported by ingestion. Direct-file inspection is for diagnostics. Dataset processing uses `DatasetReader` lifecycle checks, approved snapshot records, and the registered video checksum. An offline copy cannot learn about a later consent withdrawal without a current registry or revocation notice.
+
+### Timestamps and sampling
+
+The decoder uses PyAV’s frame PTS and rational time base. `timestamp_ms` is the original PTS in milliseconds and can start at a nonzero or negative value. Annotation marks are relative to the first displayed frame, matching the annotation tool. A frame is included when its recording-relative time is in `[start_ms, end_ms)`. Its `relative_timestamp_ms` measures time from the annotation start. Frame indices count sequentially from the start of the source, including frames before the interval. The reusable API returns exact `Fraction` timestamps. JSON reports floor them to whole milliseconds.
+
+RGB arrays use `uint8` with shape `(height, width, 3)`. Decoding keeps the encoded raster dimensions and orientation. Display rotation is exposed as metadata; the pixels stay in source order. Missing PTS, decreasing PTS, corruption, and detectable premature EOF fail processing. Repeated PTS are reported and retained in all-frames mode. A clean early EOF cannot always be identified when a standalone diagnostic file lacks reliable frame-count and duration metadata.
+
+At the requested FPS, each source frame is assigned to the nearest tick on a grid starting at the annotation boundary. A tie between ticks goes to the earlier tick. When frames map to the same tick, the one closest to it wins, with the earlier decoded frame winning ties. An in-range trailing frame can map to the next tick beyond the exclusive end. Only the actual source frame is emitted. Empty in-range slots are reported as gaps. The sampler holds one candidate and the next frame as it advances. `--all-frames` bypasses the grid.
+
+Effective output FPS is the number of emitted frames divided by the full selected interval duration. A diagnostic that reads to EOF uses the available presentation duration. `decoded_frames` counts frames inside the interval, `source_frames_decoded` also counts frames inspected before the interval and at its end, and `skipped_frames` counts interval frames omitted from the output. A batch continues past individual missing or corrupt videos, reports failures per sample, and exits with a nonzero status if any fail. A dataset access or manifest failure stops the batch.
+
+### Preview and library use
+
+Focus the preview and press Space, Right, or N to step forward. Q or Esc exits. The RGB arrays stay unchanged while OpenCV draws on BGR display copies. The optional contact sheet writes up to 12 thumbnails to a new PNG or JPEG, using the first selected frames. Processing otherwise saves no images or frame tensors.
+
+```python
+from dataset_export.reader import DatasetReader
+from landmarks.service import DecodingService
+
+dataset = DatasetReader("datasets/exports/ugsl-isolated-signs-v1.0.0", storage_root="datasets/raw")
+with DecodingService(dataset, fps=30).process("SAMPLE_ID") as run:
+    for frame in run:
+        print(frame.frame_index, frame.timestamp_ms, frame.image.shape)
+print(run.summary.status)
+```
+
+The context manager releases the decoder if iteration ends early. OpenCV and PyAV can emit duplicate AVFoundation class diagnostics on macOS when their installed wheels bundle different copies of FFmpeg. The frame decoder opens local files through PyAV, and the existing camera CLI loads independently of PyAV.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -493,3 +536,142 @@ Use a fresh test database and raw dataset directory. Set `UGSL_REGISTRY_DB` and 
 4. [ ] Modify a video copy in a disposable export and confirm integrity verification fails. Confirm a missing reference video is also reported.
 5. [ ] Withdraw the test signer's consent. Use `dataset affected` to find the versions, verify that an intact revoked version reports use blocked, and confirm the reader refuses it with the registry or revocation notice. Check that finalized manifest hashes are unchanged.
 6. [ ] Run `dataset reconcile --dry-run` before reconciling any interrupted test export. Confirm incomplete builds stay unavailable. Confirm a complete recoverable build reports the proposed activation without changing the registry in dry-run mode.
+
+### Phase 2.1 decoding checks
+
+1. [ ] Run `frames inspect` on a known approved sample. Check that the reported annotation boundaries match the saved review and that the first and last selected timestamps fit the interval after accounting for the source PTS origin.
+2. [ ] Run `frames sample --fps 30` and `frames sample --all-frames` on the same sample. Confirm the source timestamps are preserved and the sample rate is reported separately from the source rate. For a lower-rate recording, check that gaps are listed and frames are not duplicated.
+3. [ ] Open the preview, step through the clip, and check the frame indices and relative times. Exit early and confirm processing is reported as cancelled. Save a contact sheet to a new path and confirm the export manifest and video checksum stay unchanged.
+4. [ ] Run `frames validate-dataset` against a disposable export with one unavailable video. Confirm it reports that sample as failed and processes the remaining clips. Revoke the test export and confirm processing is blocked when its registry is provided.
+
+
+## Phase 2.2 hand landmark extraction
+
+Install the current requirements in a Python 3.11+ environment. MediaPipe uses
+`opencv-contrib-python`, which provides the same `cv2` interface used by the
+existing capture and preview commands. Use a fresh environment when upgrading
+from an installation that already has `opencv-python` to keep a single OpenCV
+distribution.
+
+The default model is Google's official MediaPipe Hand Landmarker float16
+bundle, **version 1**, stored at `models/hand_landmarker.task`. The tested
+runtime is MediaPipe **0.10.35**. The extraction report records the installed
+runtime and calculates the SHA-256 of the bytes actually passed to MediaPipe.
+The bundled asset is recorded in `models/hand_landmarker.task.sha256`.
+
+```bash
+shasum -a 256 -c models/hand_landmarker.task.sha256
+```
+
+SHA-256: `fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1`
+
+[Official model bundle](https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task)
+· [MediaPipe Hand Landmarker documentation](https://developers.google.com/edge/mediapipe/solutions/vision/hand_landmarker?tab=Python)
+
+### Commands
+
+Select a registered export by name and version. The approved annotation interval,
+video integrity, and dataset permission checks are shared with the `frames`
+commands.
+
+```bash
+python cli.py hands extract SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0
+python cli.py hands visualize SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0
+python cli.py hands visualize SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0 --skeleton-only
+python cli.py hands inspect SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0
+python cli.py hands extract SAMPLE_ID --dataset ugsl-isolated-signs --version 1.0.0 --output ./debug/
+python cli.py hands inspect-file ./test-video.mp4
+python cli.py hands inspect-dataset --dataset ugsl-isolated-signs --version 1.0.0 > extraction_report.json
+```
+
+Set group options before the command. Use `--model PATH` or `UGSL_HAND_MODEL`
+to choose a local bundle. The confidence options `--detection-confidence`,
+`--presence-confidence`, and `--tracking-confidence` default to 0.5.
+Sampling targets 30 fps by default. Use `--fps N` or `--all-frames` to change
+it. On macOS, run native inference and window playback in a desktop session
+with access to the system graphics service. Press Q or Escape to close playback.
+
+`inspect-file` reads a local diagnostic clip. Dataset extraction requires an
+eligible registered export. `inspect-dataset` prints a JSON summary with
+separate outcomes for individual samples. A corrupt or missing sample does
+not stop processing of the other eligible samples. A dataset permission failure
+stops the batch. With `--output`, a successful extraction writes
+`debug/SAMPLE_ID/hand_landmarks.npz` and `extraction_report.json`. Existing
+sample directories are protected, and failed or cancelled extractions produce
+no NPZ. Keep debug artifacts with the access controls appropriate for the source
+recordings.
+
+### Array schema and handedness
+
+Schema `1.0` uses anatomical **LEFT** at index 0 and **RIGHT** at index 1.
+The default uses the Tasks handedness labels for unmirrored stored pixels. If
+the actual video file is horizontally mirrored, set `--mirrored-input` to
+swap the canonical assignments. A mirrored camera preview alone does not
+require the option. Pixels and coordinates stay in the source image's coded
+orientation. The JSON reports the original labels and scores in either mode.
+Duplicate, tied, or missing labels leave the affected slots empty and record
+the raw predictions and available unassigned geometry for review.
+[MediaPipe handedness convention](https://github.com/google-ai-edge/mediapipe/blob/master/mediapipe/tasks/cc/vision/hand_landmarker/hand_landmarker_result.h#L26-L34)
+
+| NPZ key | Shape | Type |
+| --- | --- | --- |
+| `image_landmarks` | `(T, 2, 21, 3)` | `float32` |
+| `world_landmarks` | `(T, 2, 21, 3)` | `float32` |
+| `presence_mask` | `(T, 2)` | `bool` |
+| `handedness_score` | `(T, 2)` | `float32` |
+| `timestamps_ms` | `(T,)` | `int64` |
+| `schema_version` | scalar | Unicode string |
+
+Each landmark is an unmodified MediaPipe `[x, y, z]` triple stored at float32
+precision. World coordinates are hand-relative model estimates. Unavailable
+world landmarks are entirely NaN even when the image slot is present. Absent
+slots have NaN landmarks and scores. A successful extraction with zero hands
+still contains every sampled timestamp. Source presentation timestamps are
+floored to whole milliseconds, matching Phase 2.1. An invalid or non-increasing
+millisecond timestamp fails the extraction and is never shifted to make it fit.
+
+```python
+import numpy as np
+
+with np.load("debug/SAMPLE_ID/hand_landmarks.npz", allow_pickle=False) as sample:
+    print(sample["timestamps_ms"][:3])        # e.g. [125, 166, 208]
+    print(sample["presence_mask"][:3])        # e.g. [[True, False], [False, False], [True, True]]
+    print(sample["image_landmarks"][0, 0, 0]) # first frame, left wrist [x, y, z]
+```
+
+Coverage measures frames with valid canonical slots. The report separately
+counts frames with zero raw image detections so ambiguous frames can be
+distinguished from an empty camera image. A no-detection run of 1,000 ms between
+sampled timestamps produces a warning by default. Use `--no-hand-warning-ms`
+to adjust it. One-handed signs are valid. Coverage and handedness scores measure
+detector behavior. Linguistic correctness remains part of review. Timing
+includes model initialization, decoding, and inference, and excludes playback
+waits.
+
+### Manual test with real recordings
+
+1. Record an unmirrored clip showing only your anatomical left hand, another
+   with only your right hand, and one with both hands. Pause out of view in one
+   clip to create a span without detections. Include normal UGSL signing speed
+   and lighting. Where possible, include one approved one-handed sign and one
+   approved two-handed sign.
+2. Run `hands inspect-file` on each clip. Check that the active slot follows
+   the signer's hand, the raw labels are recorded, and a vanished hand has no
+   carried-forward landmarks. Re-encode one clip with a horizontal flip and
+   repeat with `hands --mirrored-input inspect-file`. Its anatomical slot
+   should match the original while the raw label reflects the mirrored pixels.
+3. Run `hands visualize` on an approved sample and then repeat with
+   `--skeleton-only`. Check fingertips, finger connections, wrists, two distinct
+   colors, labels, frame numbers, and timestamps. Check that Q closes playback.
+4. Export one debug result and open it with the NumPy example above. Compare its
+   timestamps with `frames sample` using the same sampling options. Confirm that
+   the first and last selected frames fall inside the approved annotation and
+   that masked slots are all NaN.
+5. Inspect the dataset report and verify that one- and two-handed clips
+   contribute to coverage, a blank clip still completes, and invalid inputs
+   are reported separately. Confirm no technical or linguistic review status
+   changes.
+
+Run `python -m pytest` for the automated suite. To include the native model
+smoke test from a session with graphics-service access, run
+`UGSL_RUN_NATIVE_HAND_TEST=1 python -m pytest`.

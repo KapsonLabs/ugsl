@@ -141,3 +141,29 @@ class ReviewConfig:
         except ValueError as exc:
             raise ValueError("Annotation confidence limits must be numbers.") from exc
         return cls(os.environ.get("UGSL_REVIEW_POLICY", "SINGLE"), minimum, maximum)
+
+
+HAND_MODEL_PATH = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
+
+
+@dataclass(frozen=True)
+class HandExtractionConfig:
+    """Settings for one MediaPipe tracking session per video."""
+
+    model_path: Path = HAND_MODEL_PATH
+    min_detection_confidence: float = 0.5
+    min_presence_confidence: float = 0.5
+    min_tracking_confidence: float = 0.5
+    mirrored_input: bool = False
+    no_hand_warning_ms: int = 1000
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "model_path", Path(self.model_path).expanduser())
+        for name in ("min_detection_confidence", "min_presence_confidence", "min_tracking_confidence"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be a finite number from 0 to 1.")
+        if type(self.mirrored_input) is not bool:
+            raise ValueError("mirrored_input must be Boolean.")
+        if type(self.no_hand_warning_ms) is not int or self.no_hand_warning_ms < 1:
+            raise ValueError("no_hand_warning_ms must be a positive integer.")
